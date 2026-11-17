@@ -1,4 +1,5 @@
 //! Command-line entry point; all public commands are declared with clap.
+mod logs;
 mod service;
 
 use anyhow::{Context, Result, bail};
@@ -32,6 +33,8 @@ enum Commands {
     Daemon,
     /// Show local identity, service properties, and timestamped runtime state.
     Status(OutputArgs),
+    /// Show local daemon logs, optionally following new records.
+    Logs(logs::LogArgs),
     /// Check configuration, authentication, and deployment environments.
     Doctor(OutputArgs),
     /// Check or install a signed release from CertKite.
@@ -76,6 +79,7 @@ fn json_requested(command: &Commands) -> bool {
     match command {
         Commands::Status(args) | Commands::Doctor(args) => args.json,
         Commands::Update(args) => args.json,
+        Commands::Logs(args) => args.json,
         _ => false,
     }
 }
@@ -108,11 +112,15 @@ async fn wait_for_update(
     }
 }
 
-async fn execute(cli: Cli) -> Result<u8> {
+async fn execute(
+    cli: Cli,
+    log_receiver: Option<tokio::sync::mpsc::Receiver<certkite_client::logging::LogEntry>>,
+) -> Result<u8> {
     match cli.command {
         Commands::Daemon => {
-            certkite_client::daemon::run(&cli.config).await?;
+            certkite_client::daemon::run_with_logs(&cli.config, log_receiver).await?;
         }
+        Commands::Logs(args) => logs::show(args).await?,
         Commands::Status(args) => {
             let snapshot = certkite_client::status()?;
             let service = if cfg!(target_os = "linux") {
@@ -222,20 +230,12 @@ async fn execute(cli: Cli) -> Result<u8> {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = json_requested(&cli.command);
+    let daemon = matches!(&cli.command, Commands::Daemon);
     // Dependency trace output may contain complete WebSocket certificate messages.
     let filter = format!(
         "warn,certkite_client={},certkite_deploy={},certkite_protocol={}",
         cli.log_level, cli.log_level, cli.log_level
     );
-    if let Err(error) = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .try_init()
-    {
-        eprintln!("cannot initialize logging: {error}");
-        return ExitCode::from(1);
-    }
     if matches!(
         &cli.command,
         Commands::Service {
@@ -278,9 +278,48 @@ async fn main() -> ExitCode {
         }
         return ExitCode::from(3);
     }
-    match execute(cli).await {
+    let log_receiver = if daemon && cfg!(target_os = "linux") {
+        use tracing_subscriber::prelude::*;
+        let setup = (|| -> Result<_> {
+            let config = certkite_client::config::Config::load(&cli.config)?;
+            let (layer, receiver) = certkite_client::logging::LogLayer::new(
+                Path::new(certkite_client::config::STATE_DIR),
+                config.access_key(),
+            )?;
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new(filter.clone()))
+                .with(layer)
+                .try_init()
+                .map_err(|error| anyhow::anyhow!("cannot initialize logging: {error}"))?;
+            Ok(receiver)
+        })();
+        match setup {
+            Ok(receiver) => Some(receiver),
+            Err(error) => {
+                eprintln!("{error:#}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        if let Err(error) = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init()
+        {
+            eprintln!("cannot initialize logging: {error}");
+            return ExitCode::from(1);
+        }
+        None
+    };
+    match execute(cli, log_receiver).await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
+            if daemon {
+                // The daemon's tracing sink sanitizes errors before stderr and disk output.
+                tracing::error!(target: "certkite_client", error = %format!("{error:#}"), "command failed");
+                return ExitCode::from(1);
+            }
             if json {
                 if let Err(write_error) = output(
                     &json!({"ok":false,"code":"operation_failed","message":format!("{error:#}")}),
@@ -303,6 +342,9 @@ mod tests {
         for args in [
             vec!["certkite", "__daemon"],
             vec!["certkite", "status", "--json"],
+            vec![
+                "certkite", "logs", "--follow", "--lines", "50", "--level", "warn", "--json",
+            ],
             vec!["certkite", "doctor"],
             vec!["certkite", "update", "--check", "--to", "1.2.3"],
             vec!["certkite", "service", "install"],
@@ -354,5 +396,7 @@ mod tests {
         assert!(Cli::try_parse_from(["certkite", "run"]).is_err());
         assert!(Cli::try_parse_from(["certkite", "--log-level", "invalid", "__daemon"]).is_err());
         assert!(Cli::try_parse_from(["certkite", "service"]).is_err());
+        assert!(Cli::try_parse_from(["certkite", "logs", "--lines", "0"]).is_err());
+        assert!(Cli::try_parse_from(["certkite", "logs", "--lines", "1001"]).is_err());
     }
 }

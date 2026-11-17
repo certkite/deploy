@@ -32,6 +32,14 @@ pub fn build_id() -> &'static str {
 
 /// Run until SIGINT or SIGTERM, draining an in-progress publication before exit.
 pub async fn run(config_path: &Path) -> Result<()> {
+    run_with_logs(config_path, None).await
+}
+
+/// Run with an optional independent log delivery worker.
+pub async fn run_with_logs(
+    config_path: &Path,
+    logs: Option<tokio::sync::mpsc::Receiver<crate::logging::LogEntry>>,
+) -> Result<()> {
     ensure!(
         cfg!(target_os = "linux"),
         "the daemon requires Linux; use doctor for local diagnostics"
@@ -86,6 +94,16 @@ pub async fn run(config_path: &Path) -> Result<()> {
         }
     });
     notify_ready()?;
+    let (stop_reporter, reporter_shutdown) = tokio::sync::oneshot::channel();
+    let reporter = logs.map(|logs| {
+        tokio::spawn(crate::logging::report(
+            logs,
+            identity.client_id.to_string(),
+            config.access_key().to_owned(),
+            reporter_shutdown,
+        ))
+    });
+    tracing::info!(version = VERSION, targets = targets.len(), "client started");
     let mut failures = 0u32;
     let outcome = async {
         loop {
@@ -139,6 +157,27 @@ pub async fn run(config_path: &Path) -> Result<()> {
     status.connected = false;
     status.updated_at = state::now()?;
     save_status(&directory, &status).await?;
+    tracing::info!("client stopped");
+    if outcome.is_err() {
+        tracing::error!("client stopped after a runtime failure; inspect local service status");
+    }
+    if let Some(mut reporter) = reporter {
+        if stop_reporter.send(()).is_err() {
+            eprintln!("Core log worker already stopped");
+        }
+        match timeout(Duration::from_secs(5), &mut reporter).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("Core log worker failed: {error}"),
+            Err(_) => {
+                reporter.abort();
+                if let Err(error) = reporter.await
+                    && !error.is_cancelled()
+                {
+                    eprintln!("Core log worker failed: {error}");
+                }
+            }
+        }
+    }
     outcome
 }
 
@@ -192,6 +231,7 @@ pub(crate) async fn session(
         result = timeout(Duration::from_secs(15), receive_welcome(&mut socket)) => result.context("registration timed out")??,
         _ = shutdown.changed() => return Ok(()),
     };
+    tracing::info!("connected to Core");
     status.connected = true;
     status.last_seen_at = Some(state::now()?);
     status.updated_at = state::now()?;
@@ -236,6 +276,9 @@ pub(crate) async fn session(
                                         let result = failed_result(&message, ErrorCode::Busy, true, "another operation is running");
                                         send(&mut socket, &ClientMessage::Result { client_id: client_id.clone(), result }).await?;
                                     } else {
+                                        if let ServerMessage::Deploy { request_id, target, .. } | ServerMessage::Test { request_id, target } = &message {
+                                            tracing::info!(%request_id, %target, "operation started");
+                                        }
                                         let config = config.clone();
                                         let targets = targets.clone();
                                         let directory = directory.to_owned();
@@ -484,6 +527,14 @@ fn execute(
             };
             result.code = code;
             result.message = explanation.into();
+        }
+    }
+    match result.status {
+        ResultStatus::Success => {
+            tracing::info!(request_id = %result.request_id, target = %result.target, message = %result.message, "operation completed")
+        }
+        ResultStatus::Failed => {
+            tracing::warn!(request_id = %result.request_id, target = %result.target, code = ?result.code, "operation failed")
         }
     }
     result

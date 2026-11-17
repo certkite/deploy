@@ -119,6 +119,7 @@ credentials and private keys are excluded from protocol Debug output.
 
 ```text
 certkite status [--json]
+certkite logs [-n LINES] [-f] [--level LEVEL] [--json]
 certkite doctor [--json]
 certkite update [--check] [--to VERSION] [--json]
 certkite service install
@@ -126,13 +127,57 @@ certkite service uninstall
 ```
 
 Global flags: `--config PATH`, `--log-level LEVEL`, `--help`, `--version`.
-The daemon entry point is private; use systemd for service lifecycle and logs:
+The daemon entry point is private; use systemd for service lifecycle:
 
 ```sh
 sudo certkite status --json
 sudo systemctl restart certkite
-sudo journalctl -u certkite -f
+sudo certkite logs -f
 ```
+
+### Logs
+
+The daemon records startup, Core connection, operation progress, results and failures.
+Logs are sanitized before writing to private JSON Lines files in
+`/var/lib/certkite-client/`: `client.log` and one rotated file, `client.log.1`.
+Each file is capped at 2 MiB and uses mode 0600. A shared process lock keeps reads
+consistent with appends and rotation. Logging also writes to stderr,
+which systemd captures in its journal. Configuration failures before logging starts
+remain available with `journalctl -u certkite`.
+
+```sh
+sudo certkite logs                  # Latest 100 records
+sudo certkite logs -n 200           # Latest 200 records (maximum 1000)
+sudo certkite logs -f               # Follow new records; Ctrl+C exits
+sudo certkite logs --level error    # Exact severity filter
+sudo certkite logs --json           # One JSON record per line
+```
+
+Records include a unique ID, Unix millisecond timestamp, severity and message.
+Supported severity filters are `error`, `warn`, `info` and `debug`; trace events
+are represented as DEBUG. The global `--log-level` controls collection, so debug
+records require starting the service with `--log-level debug`.
+
+The daemon independently uploads logs to `POST https://certkite.com/client/v1/logs`
+over verified TLS using its access key in the Authorization header. Core stores
+these records in its existing deployment log store. In Core Web, open
+**Deployment → client → Client logs** for history, severity/time/search filters and
+live updates. The first accepted log registers an offline client identity if
+needed; deployment connections maintain online status. Log and deployment registration
+share the same ownership check. Log reads and writes reject client IDs shared by
+different accounts, including historical records. A deleted identity requires
+registration through a deployment connection before logs are accepted again; a
+previous deleted record does not block the same account’s current active identity. Certificate/private-key material and
+the configured access key are redacted locally, with additional sanitization in Core.
+
+Delivery uses a 256-record memory queue and up to three attempts for transient
+failures. Queue overflow and failed uploads remain in local files; they are not
+replayed automatically after a restart or reconnect. A slow log server cannot
+block certificate publication. Shutdown allows up to five seconds to finish uploads.
+Local rotation and Core retention are independent; Core uses its configured log store.
+
+Deploy the matching Core backend and proxy `/client/v1/logs` to it before enabling
+remote viewing. The log endpoint is independent of the `/client/v1/connect` adapter.
 
 Status includes timestamped snapshots, not a claim of current platform connectivity.
 Doctor checks configuration, automatic service discovery, target storage, the
@@ -145,7 +190,8 @@ Exit codes: 0 success, 1 operation failure, 2 command usage error, 3 configurati
 failure for the daemon, doctor or service installation, and 4 when doctor completes with
 failed checks. Creating the initial configuration template is successful but does not
 install or start the service.
-JSON command results go to stdout; logs go to stderr.
+JSON command results and `certkite logs` output go to stdout; diagnostic output goes
+to stderr.
 
 ## Certificate publication
 

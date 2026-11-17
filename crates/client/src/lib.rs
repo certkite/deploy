@@ -3,6 +3,7 @@
 pub mod config;
 pub mod daemon;
 pub mod identity;
+pub mod logging;
 pub mod state;
 pub mod transport;
 pub mod update;
