@@ -1,0 +1,22 @@
+name: Linux qualification
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  systemd:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@5445741acf05630efa19e221cc588ebe0842b13d
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - run: sudo apt-get update && sudo apt-get install -y nginx
+      - name: Verify unprivileged signed installation
+        run: python3 packaging/tests/installer.py
+      - name: Qualify real systemd update and rollback
+        run: sudo env CERTKITE_DISPOSABLE_VM=1 python3 packaging/tests/linux-systemd.py
+      - name: Collect service logs
+        if: failure()
+        run: sudo journalctl -u certkite -u nginx --no-pager -n 200
