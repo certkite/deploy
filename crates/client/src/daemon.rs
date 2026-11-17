@@ -42,10 +42,6 @@ pub async fn run(config_path: &Path) -> Result<()> {
     );
     let config = Arc::new(Config::load(config_path)?);
     let discovered = tokio::task::spawn_blocking(certkite_deploy::discover).await??;
-    ensure!(
-        !discovered.is_empty(),
-        "no active Nginx or Caddy virtual hosts were detected"
-    );
     let targets = Arc::new(
         discovered
             .into_iter()
@@ -243,7 +239,7 @@ pub(crate) async fn session(
                                         let config = config.clone();
                                         let targets = targets.clone();
                                         let directory = directory.to_owned();
-                                        work.spawn_blocking(move || execute(message, &config, &targets, &directory));
+                                        work.spawn_blocking(move || execute(message, &config, &targets, &directory, Path::new(certkite_deploy::CERTIFICATE_ROOT)));
                                     }
                                 },
                                 ServerMessage::Error { .. } => bail!("server rejected the session"),
@@ -339,6 +335,7 @@ fn execute(
     config: &Config,
     targets: &BTreeMap<String, certkite_deploy::TargetConfig>,
     directory: &Path,
+    certificate_root: &Path,
 ) -> OperationResult {
     let mut result = failed_result(
         &message,
@@ -372,13 +369,33 @@ fn execute(
     if pending.exists() {
         return failed_result(&message, ErrorCode::Busy, true, "client is updating");
     }
-    let Some(target) = targets.get(&result.target) else {
-        return failed_result(
-            &message,
-            ErrorCode::TargetUnavailable,
-            false,
-            "target is not available",
-        );
+    let download_only = !targets.contains_key(&result.target);
+    let files;
+    let target = match targets.get(&result.target) {
+        Some(target) => target,
+        None if matches!(&message, ServerMessage::Deploy { .. }) => {
+            if !certkite_protocol::valid_id(&result.target, 64) {
+                return failed_result(
+                    &message,
+                    ErrorCode::InvalidRequest,
+                    false,
+                    "invalid target identifier",
+                );
+            }
+            files = certkite_deploy::TargetConfig::Files {
+                // Keep downloads away from service journals and configuration backups.
+                directory: certificate_root.join("downloads").join(&result.target),
+            };
+            &files
+        }
+        None => {
+            return failed_result(
+                &message,
+                ErrorCode::TargetUnavailable,
+                false,
+                "target is not available",
+            );
+        }
     };
     if let ServerMessage::Deploy { domain, .. } = &message
         && !target.domains().is_empty()
@@ -403,24 +420,38 @@ fn execute(
             fullchain_pem,
             private_key_pem,
             ..
-        } => certkite_deploy::deploy(
-            target,
-            &certkite_deploy::Deployment {
-                operation_id,
-                generation: *generation,
-                domain,
-                fullchain_pem,
-                private_key_pem,
-            },
-        )
-        .map(|outcome| (outcome.changed, Some(outcome.generation))),
+        } => (|| {
+            if download_only {
+                certkite_deploy::TargetConfig::Files {
+                    directory: certificate_root.join("downloads"),
+                }
+                .prepare()?;
+                target.prepare()?;
+            }
+            certkite_deploy::deploy(
+                target,
+                &certkite_deploy::Deployment {
+                    operation_id,
+                    generation: *generation,
+                    domain,
+                    fullchain_pem,
+                    private_key_pem,
+                },
+            )
+            .map(|outcome| (outcome.changed, Some(outcome.generation)))
+        })(),
         _ => unreachable!("executor receives operations only"),
     };
     match outcome {
         Ok((changed, generation)) => {
             result.status = ResultStatus::Success;
             result.code = ErrorCode::Ok;
-            result.message = "operation completed".into();
+            result.message = if download_only {
+                "certificate downloaded; deployment skipped because target is not available"
+            } else {
+                "operation completed"
+            }
+            .into();
             result.changed = Some(changed);
             result.generation = generation;
         }
@@ -516,9 +547,177 @@ fn notify_ready() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{domain_matches, encode, hello_message};
-    use crate::identity::Identity;
-    use std::collections::BTreeMap;
+    use super::{domain_matches, encode, execute, hello_message};
+    use crate::{config::Config, identity::Identity, session_tests::certificate, state};
+    use certkite_deploy::TargetConfig;
+    use certkite_protocol::{ErrorCode, ResultStatus, ServerMessage};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
+
+    #[test]
+    fn unavailable_target_downloads_certificates_without_deploying_other_sites() {
+        let (cert, key) = certificate();
+        for target_id in ["nginx", "caddy"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let certificates = root.join("certificates");
+            fs::create_dir(&certificates).unwrap();
+            let config: Config = toml::from_str("accessKey='test-key'").unwrap();
+            let config_file = root.join("nginx.conf");
+            let source = "server { server_name example.com; }";
+            fs::write(&config_file, source).unwrap();
+            let legacy = certificates.join(target_id);
+            fs::create_dir(&legacy).unwrap();
+            fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+            let fingerprint = "a".repeat(64);
+            state::write_json(&legacy.join("state.json"), &serde_json::json!({
+                "generation": 1,
+                "operations": {"interrupted": {
+                    "digest": fingerprint,
+                    "outcome": {"changed": true, "generation": 1, "fingerprint": fingerprint},
+                    "committed": false
+                }},
+                "pending": {"operation_id": "interrupted", "previous": null, "next": format!("versions/{fingerprint}")}
+            })).unwrap();
+            let metadata = fs::metadata(&config_file).unwrap();
+            state::write_json(
+                &legacy.join("config-backup.json"),
+                &serde_json::json!({
+                    "path": config_file,
+                    "mode": metadata.mode() & 0o777,
+                    "uid": metadata.uid(),
+                    "gid": metadata.gid(),
+                    "bytes": b"old service configuration".as_slice()
+                }),
+            )
+            .unwrap();
+            let legacy_mode = if target_id == "caddy" { 0o750 } else { 0o700 };
+            fs::set_permissions(&legacy, fs::Permissions::from_mode(legacy_mode)).unwrap();
+            let journal = fs::read(legacy.join("state.json")).unwrap();
+            let backup = fs::read(legacy.join("config-backup.json")).unwrap();
+            let mut targets = BTreeMap::new();
+            if target_id == "caddy" {
+                targets.insert(
+                    "other-site".into(),
+                    TargetConfig::NginxSite {
+                        directory: certificates.join("other-site"),
+                        nginx_binary: root.join("missing-nginx"),
+                        systemd_unit: "nginx.service".into(),
+                        config_file: config_file.clone(),
+                        domains: vec!["example.com".into()],
+                    },
+                );
+            }
+            for (operation, generation, expected) in [
+                ("op_1", 2, ErrorCode::Ok),
+                ("op_1", 2, ErrorCode::Ok),
+                ("op_older", 1, ErrorCode::StaleOperation),
+                ("op_invalid", 3, ErrorCode::CertificateInvalid),
+            ] {
+                let result = execute(
+                    ServerMessage::Deploy {
+                        request_id: "req_1".into(),
+                        operation_id: operation.into(),
+                        target: target_id.into(),
+                        generation,
+                        domain: "example.com".into(),
+                        fullchain_pem: cert.clone(),
+                        private_key_pem: if operation == "op_invalid" {
+                            "invalid key".into()
+                        } else {
+                            key.clone()
+                        },
+                    },
+                    &config,
+                    &targets,
+                    &root,
+                    &certificates,
+                );
+                assert_eq!(fs::read_to_string(&config_file).unwrap(), source);
+                assert_eq!(fs::read(legacy.join("state.json")).unwrap(), journal);
+                assert_eq!(fs::read(legacy.join("config-backup.json")).unwrap(), backup);
+                assert_eq!(result.code, expected);
+                assert_eq!(
+                    result.status,
+                    if expected == ErrorCode::Ok {
+                        ResultStatus::Success
+                    } else {
+                        ResultStatus::Failed
+                    }
+                );
+                if expected == ErrorCode::Ok {
+                    assert!(result.message.contains("deployment skipped"));
+                    assert_eq!(result.generation, Some(generation));
+                }
+            }
+            let current = certificates
+                .join("downloads")
+                .join(target_id)
+                .join("current");
+            assert_eq!(
+                fs::read_to_string(current.join("fullchain.pem")).unwrap(),
+                cert
+            );
+            assert_eq!(
+                fs::read_to_string(current.join("privkey.pem")).unwrap(),
+                key
+            );
+            assert_eq!(
+                fs::metadata(current.join("privkey.pem"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(fs::metadata(&legacy).unwrap().mode() & 0o777, legacy_mode);
+            assert!(!legacy.join("current").exists());
+            assert!(!certificates.join("other-site").exists());
+        }
+    }
+
+    #[test]
+    fn missing_target_checks_and_mismatched_site_domains_still_fail() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let certificates = root.join("certificates");
+        let config: Config = toml::from_str("accessKey='test-key'").unwrap();
+        let targets = BTreeMap::from([(
+            "web".into(),
+            TargetConfig::NginxSite {
+                directory: certificates.join("web"),
+                nginx_binary: root.join("missing-nginx"),
+                systemd_unit: "nginx.service".into(),
+                config_file: root.join("nginx.conf"),
+                domains: vec!["other.example.com".into()],
+            },
+        )]);
+        for message in [
+            ServerMessage::Test {
+                request_id: "req_1".into(),
+                target: "missing".into(),
+            },
+            ServerMessage::Deploy {
+                request_id: "req_2".into(),
+                operation_id: "op_1".into(),
+                target: "web".into(),
+                generation: 1,
+                domain: "example.com".into(),
+                fullchain_pem: "cert".into(),
+                private_key_pem: "key".into(),
+            },
+        ] {
+            let result = execute(message, &config, &targets, &root, &certificates);
+            assert_eq!(result.status, ResultStatus::Failed);
+            assert_eq!(result.code, ErrorCode::TargetUnavailable);
+        }
+        assert!(!certificates.exists());
+    }
 
     #[test]
     fn target_domain_matching_is_exact_or_one_label_wildcard() {

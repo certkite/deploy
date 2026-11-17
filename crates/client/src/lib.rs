@@ -99,8 +99,8 @@ pub async fn doctor(path: &Path) -> Result<DoctorReport> {
         checks.insert(
             "discovery".into(),
             Check {
-                ok: false,
-                message: "no active Nginx or Caddy virtual hosts were detected".into(),
+                ok: true,
+                message: "no active Nginx or Caddy virtual hosts detected; certificates will be downloaded without deployment".into(),
             },
         );
     }

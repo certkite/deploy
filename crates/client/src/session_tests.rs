@@ -16,7 +16,7 @@ use openssl::{
 use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, sync::Arc};
 use tokio_tungstenite::tungstenite::Message;
 
-fn certificate() -> (String, String) {
+pub(crate) fn certificate() -> (String, String) {
     let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
     let mut name = X509NameBuilder::new().unwrap();
     name.append_entry_by_text("CN", "example.com").unwrap();

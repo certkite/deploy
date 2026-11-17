@@ -45,18 +45,22 @@ sudoedit /etc/certkite-client/config.toml
 accessKey = "replace-with-your-certkite-access-key"
 ```
 
-Service installation requires at least one active Nginx or Caddy virtual host using the
-standard service binary and configuration locations. It validates the running
-service configuration, discovers each site's domains, creates a stable
+Service installation detects active Nginx and Caddy virtual hosts using the
+standard service binary and configuration locations. It validates detected
+service configurations, discovers each site's domains, creates a stable
 local target ID, and grants the client write access only to the discovered config
-directories and managed certificate root. Configuration is mode 0600 and owned by
+directories and managed certificate root. Servers without detected virtual hosts
+can install and run the client to download certificates. Configuration is mode 0600 and owned by
 the running user. Unknown fields, including manual `targets`, are rejected. The
 endpoint has no runtime override.
 
 Each discovered virtual host is a separate authorization boundary. The client
 reports its target ID, service kind and configured domains to Core without exposing
 local paths. Core binds a certificate to that exact target; a deployment is rejected
-when its domain does not match the selected local site.
+when its domain does not match the selected local site. When the requested target
+is absent from local discovery, the client validates and saves the certificate
+without editing web-server configuration or reloading a service. The result reports
+success with a message explaining that deployment was skipped.
 
 ## Install and operate
 
@@ -148,7 +152,12 @@ The client validates SAN coverage (including IPs and single-label wildcards),
 certificate validity, key matching and supplied chain structure. The supplied last
 issuer is a deployment trust anchor; public PKI trust and revocation are not checked.
 Certificates are stored under `/var/lib/certkite-certificates/<target-id>` in
-immutable version directories before an atomic `current` switch.
+immutable version directories before an atomic `current` switch. Certificates
+downloaded for unavailable targets are stored separately under
+`/var/lib/certkite-certificates/downloads/<target-id>`, with root-only access to
+`current/fullchain.pem` and `current/privkey.pem`. Downloads have their own operation
+receipts and generation checks, and do not read or modify service deployment journals,
+configuration backups or service directory permissions.
 
 For Nginx, the matching `server` block receives or updates `listen 443 ssl`,
 `ssl_certificate` and `ssl_certificate_key`. For Caddy, the matching site block

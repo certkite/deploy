@@ -265,10 +265,6 @@ pub fn install(config: &Path) -> Result<()> {
     trusted(&config, false)?;
     certkite_client::config::Config::load(&config)?;
     let discovered = certkite_deploy::discover()?;
-    ensure!(
-        !discovered.is_empty(),
-        "no active Nginx or Caddy virtual hosts were detected"
-    );
     let mut writable_paths = vec![PathBuf::from(certkite_deploy::CERTIFICATE_ROOT)];
     for target in &discovered {
         if let Some(parent) = target.config.config_file().and_then(Path::parent) {
