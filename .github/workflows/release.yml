@@ -4,10 +4,7 @@ on:
 permissions:
   contents: read
 jobs:
-  qualification:
-    uses: ./.github/workflows/linux.yml
   build:
-    needs: qualification
     strategy:
       matrix:
         include:

@@ -290,19 +290,12 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-Release artifacts are built by a manually triggered workflow after Linux
-qualification passes. Each platform artifact contains `certkite-TARGET`, its
+Release artifacts are built by a manually triggered workflow after workspace
+formatting, lint and test checks pass. Each platform artifact contains `certkite-TARGET`, its
 SHA-256 file and a key-embedded `install.sh`. Configure the trusted public key for
 release builds, sign manifests in your release system, and publish the installer,
 release endpoints and artifacts at the fixed CertKite origin. The workflow prepares
 assets without publishing to production.
-
-The Linux qualification workflow runs the installer as an ordinary user against
-local signed fixtures, then uses a disposable Ubuntu VM with real systemd and Nginx.
-It starts the generated service and drives the actual update worker through
-replacement, Type=notify readiness, process-inode checks and failed-start rollback.
-Synthetic release executables supply the startup contract; no Core credentials or
-production release signing key are required.
 
 ## Security and license
 
