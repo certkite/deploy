@@ -26,6 +26,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Config {
     #[serde(rename = "accessKey")]
     access_key: String,
+    /// Numeric local GID authorized to read download-only certificates.
+    #[serde(default, rename = "downloadGroup")]
+    pub download_group: Option<u32>,
 }
 
 /// Effective local user, used for ownership checks.
@@ -59,7 +62,7 @@ impl Config {
             .context("cannot read configuration")?;
         let config: Self = toml::from_str(&source).map_err(|_| {
             anyhow::anyhow!(
-                "invalid configuration; check TOML syntax and the supported accessKey field"
+                "invalid configuration; check TOML syntax and the supported accessKey/downloadGroup fields"
             )
         })?;
         config.validate()?;
@@ -73,6 +76,10 @@ impl Config {
 
     /// Validate the private authentication input. Deployment targets are discovered locally.
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.download_group != Some(u32::MAX),
+            "downloadGroup must be a valid numeric Unix group ID"
+        );
         ensure!(
             !self.access_key.trim().is_empty()
                 && self.access_key.len() <= 4096
@@ -102,6 +109,21 @@ mod tests {
             assert!(!error.contains("sensitive-value"));
             assert!(error.contains("invalid configuration"));
         }
+    }
+
+    #[test]
+    fn download_group_requires_a_numeric_unix_gid() {
+        let config: Config = toml::from_str("accessKey='key'\ndownloadGroup=1234").unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.download_group, Some(1234));
+        for value in ["-1", "4294967296", "\"readers\""] {
+            assert!(
+                toml::from_str::<Config>(&format!("accessKey='key'\ndownloadGroup={value}"))
+                    .is_err()
+            );
+        }
+        let config: Config = toml::from_str("accessKey='key'\ndownloadGroup=4294967295").unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]

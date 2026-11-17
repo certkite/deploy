@@ -1,8 +1,14 @@
 # Security policy
 
 The installed service runs as root and handles TLS private keys. Keep accessKey
-configuration root-owned and mode 0600, and certificate target directories mode
-0700. Treat a shared account accessKey as having the account permissions Core
+configuration root-owned and mode 0600. Nginx and private file targets use 0700
+directories and 0600 certificate/key files. Caddy and download-only targets with
+`downloadGroup` use 0750 directories and 0640 files owned by root and the authorized
+service group. The certificate root and downloads container use 0711 for path
+traversal; journals and lock files remain 0600. Every account in `downloadGroup` can
+read all download-only private keys published with that group. Limit its membership
+to trusted service accounts. Group changes apply to each target on its next download.
+Treat a shared account accessKey as having the account permissions Core
 assigns to it; rotate it and close active sessions if a server is compromised.
 
 Report vulnerabilities privately through CertKite’s security contact/support

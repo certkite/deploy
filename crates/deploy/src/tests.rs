@@ -138,6 +138,217 @@ fn publish_deduplicate_and_generations() {
 }
 
 #[test]
+fn file_group_access_survives_renewal_and_can_be_revoked() {
+    let root = dir();
+    let directory = root.path().join("downloads");
+    let private = TargetConfig::Files {
+        directory: directory.clone(),
+    };
+    private.prepare().unwrap();
+    let (cert, key) = certificate(&["a.example.com"]);
+    deploy(&private, &request("one", 1, &cert, &key)).unwrap();
+    let first = fs::read_link(directory.join("current")).unwrap();
+    let gid = fs::metadata(root.path()).unwrap().gid();
+    let shared = TargetConfig::SharedFiles {
+        directory: directory.clone(),
+        service_group: gid,
+    };
+    shared.prepare().unwrap();
+    let (next, next_key) = certificate(&["a.example.com"]);
+    deploy(&shared, &request("two", 2, &next, &next_key)).unwrap();
+    shared.prepare().unwrap();
+    deploy(&shared, &request("two", 2, &next, &next_key)).unwrap();
+    for path in [
+        directory.clone(),
+        directory.join("versions"),
+        directory.join(&first),
+        fs::canonicalize(directory.join("current")).unwrap(),
+    ] {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o750);
+        assert_eq!(metadata.gid(), gid);
+    }
+    for entry in fs::read_dir(directory.join("versions")).unwrap() {
+        for name in ["fullchain.pem", "privkey.pem"] {
+            let metadata = fs::metadata(entry.as_ref().unwrap().path().join(name)).unwrap();
+            assert_eq!(metadata.mode() & 0o777, 0o640);
+            assert_eq!(metadata.gid(), gid);
+        }
+    }
+    for name in ["state.json", ".lock"] {
+        assert_eq!(
+            fs::metadata(directory.join(name)).unwrap().mode() & 0o777,
+            0o600
+        );
+    }
+    private.prepare().unwrap();
+    deploy(&private, &request("three", 3, &next, &next_key)).unwrap();
+    assert_eq!(
+        fs::metadata(directory.join("current/privkey.pem"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(directory.join(&first)).unwrap().mode() & 0o777,
+        0o700
+    );
+}
+
+#[test]
+fn repeated_file_preparation_preserves_existing_access_metadata() {
+    let root = dir();
+    let directory = root.path().join("shared");
+    let target = TargetConfig::SharedFiles {
+        directory: directory.clone(),
+        service_group: fs::metadata(root.path()).unwrap().gid(),
+    };
+    target.prepare().unwrap();
+    let (cert, key) = certificate(&["a.example.com"]);
+    deploy(&target, &request("one", 1, &cert, &key)).unwrap();
+    let version = fs::canonicalize(directory.join("current")).unwrap();
+    let paths = [
+        directory.clone(),
+        directory.join("versions"),
+        version.clone(),
+        version.join("fullchain.pem"),
+        version.join("privkey.pem"),
+    ];
+    let before = paths.each_ref().map(|path| fs::metadata(path).unwrap());
+    for _ in 0..16 {
+        target.prepare().unwrap();
+    }
+    for (path, before) in paths.iter().zip(before) {
+        let after = fs::metadata(path).unwrap();
+        assert_eq!(
+            (after.ctime(), after.ctime_nsec()),
+            (before.ctime(), before.ctime_nsec()),
+            "unchanged authorization must not rewrite permissions: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn file_access_migration_rejects_symlinks_without_changing_permissions() {
+    let root = dir();
+    let directory = root.path().join("target");
+    paths::directory(&directory).unwrap();
+    paths::directory(&directory.join("versions")).unwrap();
+    let outside = root.path().join("outside");
+    fs::write(&outside, "private").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+    let version = directory.join("versions").join("a".repeat(64));
+    paths::directory(&version).unwrap();
+    symlink(&outside, version.join("privkey.pem")).unwrap();
+    let target = TargetConfig::SharedFiles {
+        directory: directory.clone(),
+        service_group: fs::metadata(root.path()).unwrap().gid(),
+    };
+    assert!(target.prepare().is_err());
+    assert_eq!(fs::metadata(&outside).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+    assert!(prepare_certificate_root(&version.join("privkey.pem")).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires root in a disposable Linux environment"]
+fn service_group_can_read_downloads_after_renewal() {
+    use std::{os::unix::process::CommandExt, process::Command};
+    assert_eq!(paths::uid(), 0, "run this test as root");
+    let root = dir();
+    prepare_certificate_root(root.path()).unwrap();
+    let downloads = root.path().join("downloads");
+    paths::directory(&downloads).unwrap();
+    prepare_certificate_root(&downloads).unwrap();
+    let private = TargetConfig::Files {
+        directory: downloads.join("site"),
+    };
+    private.prepare().unwrap();
+    let (cert, mut previous_key) = certificate(&["a.example.com"]);
+    deploy(&private, &request("initial", 1, &cert, &previous_key)).unwrap();
+    let target = TargetConfig::SharedFiles {
+        directory: downloads.join("site"),
+        service_group: 62001,
+    };
+    for generation in 2..=3 {
+        prepare_certificate_root(&downloads).unwrap();
+        target.prepare().unwrap();
+        let output = Command::new("/bin/cat")
+            .arg(target.directory().join("current/privkey.pem"))
+            .uid(65534)
+            .gid(62001)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "existing certificate is unreadable after preparation"
+        );
+        assert_eq!(output.stdout, previous_key.as_bytes());
+        let (cert, key) = certificate(&["a.example.com"]);
+        previous_key = key.clone();
+        deploy(
+            &target,
+            &request(&format!("op-{generation}"), generation, &cert, &key),
+        )
+        .unwrap();
+        for (name, expected) in [("fullchain.pem", cert), ("privkey.pem", key)] {
+            let path = target.directory().join("current").join(name);
+            let output = Command::new("/bin/cat")
+                .arg(&path)
+                .uid(65534)
+                .gid(62001)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "authorized service cannot read {name}"
+            );
+            assert_eq!(output.stdout, expected.as_bytes());
+            let output = Command::new("/bin/cat")
+                .arg(&path)
+                .uid(65534)
+                .gid(62002)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "unrelated service can read {name}"
+            );
+        }
+        for name in ["state.json", ".lock"] {
+            let output = Command::new("/bin/cat")
+                .arg(target.directory().join(name))
+                .uid(65534)
+                .gid(62001)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "service can read private {name}");
+        }
+    }
+    TargetConfig::SharedFiles {
+        directory: target.directory().to_owned(),
+        service_group: 62002,
+    }
+    .prepare()
+    .unwrap();
+    for (gid, allowed) in [(62001, false), (62002, true)] {
+        let output = Command::new("/bin/cat")
+            .arg(target.directory().join("current/privkey.pem"))
+            .uid(65534)
+            .gid(gid)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), allowed);
+        if allowed {
+            assert_eq!(output.stdout, previous_key.as_bytes());
+        }
+    }
+}
+
+#[test]
 fn retains_only_current_and_previous_certificate_versions() {
     let root = dir();
     let target = TargetConfig::Files {
@@ -234,6 +445,16 @@ fn san_ip_and_chain_structure() {
 #[test]
 fn paths_and_permissions() {
     let root = dir();
+    let container = root.path().join("downloads");
+    paths::directory(&container).unwrap();
+    prepare_certificate_root(&container).unwrap();
+    assert_eq!(fs::metadata(&container).unwrap().mode() & 0o777, 0o711);
+    let invalid = TargetConfig::SharedFiles {
+        directory: root.path().join("invalid"),
+        service_group: u32::MAX,
+    };
+    assert!(invalid.prepare().is_err());
+    assert!(!invalid.directory().exists());
     let real = root.path().join("real");
     paths::directory(&real).unwrap();
     symlink(&real, root.path().join("link")).unwrap();

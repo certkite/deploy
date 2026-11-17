@@ -51,8 +51,9 @@ service configurations, discovers each site's domains, creates a stable
 local target ID, and grants the client write access only to the discovered config
 directories and managed certificate root. Servers without detected virtual hosts
 can install and run the client to download certificates. Configuration is mode 0600 and owned by
-the running user. Unknown fields, including manual `targets`, are rejected. The
-endpoint has no runtime override.
+the running user. The optional `downloadGroup` field accepts a numeric local group
+ID and authorizes that group to read download-only certificates and private keys.
+Unknown fields, including manual `targets`, are rejected. The endpoint has no runtime override.
 
 Each discovered virtual host is a separate authorization boundary. The client
 reports its target ID, service kind and configured domains to Core without exposing
@@ -154,10 +155,42 @@ issuer is a deployment trust anchor; public PKI trust and revocation are not che
 Certificates are stored under `/var/lib/certkite-certificates/<target-id>` in
 immutable version directories before an atomic `current` switch. Certificates
 downloaded for unavailable targets are stored separately under
-`/var/lib/certkite-certificates/downloads/<target-id>`, with root-only access to
+`/var/lib/certkite-certificates/downloads/<target-id>`. Services use the stable paths
 `current/fullchain.pem` and `current/privkey.pem`. Downloads have their own operation
 receipts and generation checks, and do not read or modify service deployment journals,
 configuration backups or service directory permissions.
+
+Download-only targets default to root-only access (0700 directories, 0600 files).
+To let other service accounts read them, create a dedicated group and add only the
+authorized accounts:
+
+```sh
+sudo groupadd --system certkite-tls
+sudo usermod -aG certkite-tls <service-user>
+getent group certkite-tls
+```
+
+Set `downloadGroup = <numeric-GID>` in `/etc/certkite-client/config.toml`, using the
+third field from `getent`, then restart `certkite` and the consuming service so its
+process picks up the group membership. On the next download, all retained versions
+for that target receive 0750 directories and 0640 certificate/key files owned by
+root and the configured group. Renewal preserves that access; removing the setting
+restores root-only access on the next download for each target. The certificate root
+and `downloads` container use 0711 so service users can traverse known paths.
+Journals and lock files remain 0600. Every member of the group can read all
+download-only targets published with that group.
+
+Verify with the actual service account and target ID:
+
+```sh
+sudo -u <service-user> test -r /var/lib/certkite-certificates/downloads/<target-id>/current/fullchain.pem
+sudo -u <service-user> test -r /var/lib/certkite-certificates/downloads/<target-id>/current/privkey.pem
+```
+
+Consuming services must reload certificates after renewal. For containers, mount
+the target directory, including `versions` and `current`, and provide the same
+numeric GID to the container process. Service sandboxing, SELinux and AppArmor must
+also permit access to the mounted path.
 
 For Nginx, the matching `server` block receives or updates `listen 443 ssl`,
 `ssl_certificate` and `ssl_certificate_key`. For Caddy, the matching site block

@@ -259,7 +259,7 @@ pub(crate) fn test(target: &TargetConfig) -> Result<()> {
                 "caddyfile",
             ],
         ),
-        TargetConfig::Files { .. } => Ok(()),
+        TargetConfig::Files { .. } | TargetConfig::SharedFiles { .. } => Ok(()),
     }
 }
 
@@ -268,7 +268,7 @@ pub(crate) fn reload(target: &TargetConfig) -> Result<()> {
         TargetConfig::Nginx { systemd_unit, .. }
         | TargetConfig::NginxSite { systemd_unit, .. }
         | TargetConfig::CaddySite { systemd_unit, .. } => systemd_unit,
-        TargetConfig::Files { .. } => return Ok(()),
+        TargetConfig::Files { .. } | TargetConfig::SharedFiles { .. } => return Ok(()),
     };
     #[cfg(not(test))]
     let systemctl = std::path::PathBuf::from("/usr/bin/systemctl");

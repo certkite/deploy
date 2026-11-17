@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -13,7 +13,7 @@ const NGINX_UNIT: &str = "nginx.service";
 const CADDY_UNIT: &str = "caddy.service";
 
 pub(crate) fn discover() -> Result<Vec<DiscoveredTarget>> {
-    ensure_certificate_root()?;
+    crate::prepare_certificate_root(Path::new(CERTIFICATE_ROOT))?;
     let mut targets = Vec::new();
     if service_active(NGINX_UNIT)? {
         targets.extend(discover_nginx()?);
@@ -36,29 +36,6 @@ pub(crate) fn discover() -> Result<Vec<DiscoveredTarget>> {
         "discovered duplicate deployment target"
     );
     Ok(targets)
-}
-
-fn ensure_certificate_root() -> Result<()> {
-    let root = Path::new(CERTIFICATE_ROOT);
-    match fs::create_dir(root) {
-        Ok(()) => {
-            fs::set_permissions(root, fs::Permissions::from_mode(0o711))?;
-            fs::File::open(root.parent().context("certificate root has no parent")?)?.sync_all()?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    let metadata = fs::symlink_metadata(root)?;
-    // SAFETY: geteuid has no arguments, pointer requirements or failure state.
-    let effective_uid = unsafe { libc::geteuid() };
-    ensure!(
-        metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == effective_uid
-            && metadata.mode() & 0o777 == 0o711,
-        "certificate root must be owned by the runtime user and mode 0711"
-    );
-    Ok(())
 }
 
 fn service_active(unit: &str) -> Result<bool> {
@@ -223,14 +200,22 @@ fn service_group(unit: &str) -> Result<u32> {
     };
     let group = property("Group")?;
     let user = property("User")?;
-    let account = if group.is_empty() { &user } else { &group };
+    resolve_service_group(Path::new("/usr/bin/getent"), &group, &user)
+}
+
+fn resolve_service_group(getent: &Path, group: &str, user: &str) -> Result<u32> {
+    let (database, account, field) = if group.is_empty() {
+        ("passwd", user, 3)
+    } else {
+        ("group", group, 2)
+    };
     ensure!(
         !account.is_empty(),
         "Caddy service must declare Group or User"
     );
     let output = command::capture(
-        Path::new("/usr/bin/id"),
-        &["-g", account],
+        getent,
+        &[database, account],
         Duration::from_secs(5),
         16 * 1024,
     )?;
@@ -238,8 +223,53 @@ fn service_group(unit: &str) -> Result<u32> {
         output.status.success(),
         "cannot resolve Caddy service group"
     );
-    String::from_utf8(output.stdout)?
+    let output = String::from_utf8(output.stdout)?;
+    let gid = output
         .trim()
-        .parse()
-        .context("Caddy service group ID is invalid")
+        .split(':')
+        .nth(field)
+        .context("Caddy service account is invalid")?
+        .parse::<u32>()
+        .context("Caddy service group ID is invalid")?;
+    ensure!(gid != u32::MAX, "Caddy service group ID is invalid");
+    Ok(gid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn resolves_explicit_group_and_user_primary_group_separately() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let getent = root.join("getent");
+        fs::write(
+            &getent,
+            r#"#!/bin/sh
+case "$1:$2" in
+group:tls-readers|group:4321) echo tls-readers:x:4321:;;
+passwd:caddy) echo caddy:x:1234:5678::/:/bin/false;;
+group:invalid) echo invalid:x:4294967295:;;
+*) exit 2;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&getent, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            resolve_service_group(&getent, "tls-readers", "caddy").unwrap(),
+            4321
+        );
+        assert_eq!(
+            resolve_service_group(&getent, "4321", "caddy").unwrap(),
+            4321
+        );
+        assert_eq!(resolve_service_group(&getent, "", "caddy").unwrap(), 5678);
+        assert!(resolve_service_group(&getent, "missing", "caddy").is_err());
+        assert!(resolve_service_group(&getent, "invalid", "caddy").is_err());
+        assert!(resolve_service_group(&getent, "", "").is_err());
+    }
 }

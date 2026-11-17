@@ -1,1 +1,5 @@
 accessKey = "replace-with-your-certkite-access-key"
+
+# Optional numeric GID: members can read every download-only certificate and key.
+# Look up a dedicated group with: getent group certkite-tls
+# downloadGroup = 1234

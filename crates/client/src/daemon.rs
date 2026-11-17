@@ -382,9 +382,14 @@ fn execute(
                     "invalid target identifier",
                 );
             }
-            files = certkite_deploy::TargetConfig::Files {
-                // Keep downloads away from service journals and configuration backups.
-                directory: certificate_root.join("downloads").join(&result.target),
+            // Keep downloads away from service journals and configuration backups.
+            let directory = certificate_root.join("downloads").join(&result.target);
+            files = match config.download_group {
+                Some(service_group) => certkite_deploy::TargetConfig::SharedFiles {
+                    directory,
+                    service_group,
+                },
+                None => certkite_deploy::TargetConfig::Files { directory },
             };
             &files
         }
@@ -422,10 +427,7 @@ fn execute(
             ..
         } => (|| {
             if download_only {
-                certkite_deploy::TargetConfig::Files {
-                    directory: certificate_root.join("downloads"),
-                }
-                .prepare()?;
+                certkite_deploy::prepare_certificate_root(&certificate_root.join("downloads"))?;
                 target.prepare()?;
             }
             certkite_deploy::deploy(
@@ -560,13 +562,14 @@ mod tests {
     #[test]
     fn unavailable_target_downloads_certificates_without_deploying_other_sites() {
         let (cert, key) = certificate();
-        for target_id in ["nginx", "caddy"] {
+        for (target_id, shared) in [("nginx", false), ("caddy", false), ("shared", true)] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().canonicalize().unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
             let certificates = root.join("certificates");
             fs::create_dir(&certificates).unwrap();
-            let config: Config = toml::from_str("accessKey='test-key'").unwrap();
+            let mut config: Config = toml::from_str("accessKey='test-key'").unwrap();
+            config.download_group = shared.then_some(fs::metadata(&root).unwrap().gid());
             let config_file = root.join("nginx.conf");
             let source = "server { server_name example.com; }";
             fs::write(&config_file, source).unwrap();
@@ -672,7 +675,17 @@ mod tests {
                     .permissions()
                     .mode()
                     & 0o777,
-                0o600
+                if shared { 0o640 } else { 0o600 }
+            );
+            let downloads = certificates.join("downloads");
+            assert_eq!(fs::metadata(&downloads).unwrap().mode() & 0o777, 0o711);
+            assert_eq!(
+                fs::metadata(downloads.join(target_id)).unwrap().mode() & 0o777,
+                if shared { 0o750 } else { 0o700 }
+            );
+            assert_eq!(
+                fs::metadata(current.join("privkey.pem")).unwrap().gid(),
+                fs::metadata(&root).unwrap().gid()
             );
             assert_eq!(fs::metadata(&legacy).unwrap().mode() & 0o777, legacy_mode);
             assert!(!legacy.join("current").exists());

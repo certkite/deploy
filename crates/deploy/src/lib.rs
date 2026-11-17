@@ -1,6 +1,6 @@
 //! Durable certificate publication. Consumers use `current/fullchain.pem` and
 //! `current/privkey.pem`; current is atomically switched to an immutable version.
-//! Target directories must already exist with mode 0700. Recovery must run before
+//! Target access is private or restricted to the configured service group. Recovery runs before
 //! serving requests, and is also performed by deploy while holding both locks.
 mod certificate;
 mod command;
@@ -47,6 +47,11 @@ pub enum TargetConfig {
     Files {
         directory: PathBuf,
     },
+    /// File publication readable by the locally authorized service group.
+    SharedFiles {
+        directory: PathBuf,
+        service_group: u32,
+    },
     Nginx {
         directory: PathBuf,
         nginx_binary: PathBuf,
@@ -87,6 +92,7 @@ impl TargetConfig {
     pub fn directory(&self) -> &Path {
         match self {
             Self::Files { directory }
+            | Self::SharedFiles { directory, .. }
             | Self::Nginx { directory, .. }
             | Self::NginxSite { directory, .. }
             | Self::CaddySite { directory, .. } => directory,
@@ -94,7 +100,7 @@ impl TargetConfig {
     }
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Files { .. } => "files",
+            Self::Files { .. } | Self::SharedFiles { .. } => "files",
             Self::Nginx { .. } | Self::NginxSite { .. } => "nginx",
             Self::CaddySite { .. } => "caddy",
         }
@@ -114,14 +120,14 @@ impl TargetConfig {
         }
     }
     fn directory_mode(&self) -> u32 {
-        if matches!(self, Self::CaddySite { .. }) {
+        if self.service_group().is_some() {
             0o750
         } else {
             0o700
         }
     }
     fn certificate_mode(&self) -> u32 {
-        if matches!(self, Self::CaddySite { .. }) {
+        if self.service_group().is_some() {
             0o640
         } else {
             0o600
@@ -129,11 +135,20 @@ impl TargetConfig {
     }
     fn service_group(&self) -> Option<u32> {
         match self {
-            Self::CaddySite { service_group, .. } => Some(*service_group),
+            Self::CaddySite { service_group, .. } | Self::SharedFiles { service_group, .. } => {
+                Some(*service_group)
+            }
             _ => None,
         }
     }
     pub fn prepare(&self) -> Result<()> {
+        ensure!(
+            self.service_group() != Some(u32::MAX),
+            "invalid certificate service group ID"
+        );
+        if matches!(self, Self::Files { .. } | Self::SharedFiles { .. }) {
+            return prepare_file_target(self);
+        }
         paths::directory_with(
             self.directory(),
             self.directory_mode(),
@@ -141,6 +156,10 @@ impl TargetConfig {
         )
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.service_group() != Some(u32::MAX),
+            "invalid certificate service group ID"
+        );
         paths::root_with(
             self.directory(),
             self.directory_mode(),
@@ -168,14 +187,85 @@ impl TargetConfig {
                 command::binary(caddy_binary)?;
                 validate_unit(systemd_unit)?;
             }
-            Self::Files { .. } => {}
+            Self::Files { .. } | Self::SharedFiles { .. } => {}
         }
         #[cfg(not(test))]
-        if !matches!(self, Self::Files { .. }) {
+        if !matches!(self, Self::Files { .. } | Self::SharedFiles { .. }) {
             command::binary(Path::new("/usr/bin/systemctl"))?;
         }
         Ok(())
     }
+}
+
+/// Prepare a traversable certificate container without granting directory listing.
+/// Existing private containers are upgraded after ownership and path validation.
+pub fn prepare_certificate_root(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            paths::root_with(path, 0o700, None).or_else(|_| paths::root_with(path, 0o711, None))?;
+            paths::set_access(path, 0o711, None)?;
+            paths::sync(path)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            paths::directory_with(path, 0o711, None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn prepare_file_target(target: &TargetConfig) -> Result<()> {
+    let root = target.directory();
+    match fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => paths::directory(root)?,
+        Err(error) => return Err(error.into()),
+    }
+    let validate_directory = |path: &Path| {
+        paths::root_with(path, 0o700, None).or_else(|_| paths::root_with(path, 0o750, None))
+    };
+    validate_directory(root)?;
+    let lock = paths::secure_file(&root.join(".lock"))?;
+    lock.lock_exclusive()?;
+    let mut directories = vec![root.to_owned()];
+    let mut certificates = Vec::new();
+    let versions = root.join("versions");
+    match fs::symlink_metadata(&versions) {
+        Ok(_) => {
+            validate_directory(&versions)?;
+            directories.push(versions.clone());
+            for entry in fs::read_dir(&versions)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_str().context("invalid version directory name")?;
+                if !name.starts_with(".version-") {
+                    version_path(&Path::new("versions").join(name))?;
+                }
+                let directory = entry.path();
+                validate_directory(&directory)?;
+                for name in ["fullchain.pem", "privkey.pem"] {
+                    let path = directory.join(name);
+                    paths::read_certificate(&path, 0o600, None)
+                        .or_else(|_| paths::read_certificate(&path, 0o640, None))?;
+                    if path.try_exists()? {
+                        certificates.push(path);
+                    }
+                }
+                directories.push(directory);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Reconcile every retained version so renewal and rollback keep the same readers.
+    for path in certificates {
+        paths::set_access(&path, target.certificate_mode(), target.service_group())?;
+        paths::sync(&path)?;
+    }
+    for path in directories.into_iter().rev() {
+        paths::set_access(&path, target.directory_mode(), target.service_group())?;
+        paths::sync(&path)?;
+    }
+    target.validate()
 }
 
 fn validate_unit(systemd_unit: &str) -> Result<()> {
@@ -564,11 +654,7 @@ fn publish_version(target: &TargetConfig, next: &Path, request: &Deployment<'_>)
             let temp = tempfile::Builder::new()
                 .prefix(".version-")
                 .tempdir_in(&versions)?;
-            paths::set_directory_access(
-                temp.path(),
-                target.directory_mode(),
-                target.service_group(),
-            )?;
+            paths::set_access(temp.path(), target.directory_mode(), target.service_group())?;
             paths::atomic_certificate(
                 &temp.path().join("fullchain.pem"),
                 request.fullchain_pem.as_bytes(),

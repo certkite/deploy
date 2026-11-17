@@ -10,6 +10,10 @@ An immutable `versions/<sha256>` directory is fsynced before an atomic `current`
 symlink switch. Nginx targets use root-only 0700/0600 storage. Caddy targets use
 0750 directories and 0640 certificate files owned by root and the service group,
 so the unprivileged Caddy process can read the private key without making it public.
+`SharedFiles` uses the same group access without editing or reloading a service.
+`prepare` reconciles all retained file-target versions to the selected access
+policy; journals and lock files remain private. `prepare_certificate_root` creates
+or upgrades a runtime-owned 0700/0711 container to 0711 for path traversal.
 Fingerprint is a length-framed SHA-256 over both PEM byte strings.
 
 Each new deployment reconciles the matching Nginx `server` block's

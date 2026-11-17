@@ -15,6 +15,17 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y nginx
       - name: Verify unprivileged signed installation
         run: python3 packaging/tests/installer.py
+      - name: Verify certificate access as an unprivileged service
+        run: |
+          cargo test -p certkite-deploy --locked --no-run
+          found=false
+          for test_binary in target/debug/deps/certkite_deploy-*; do
+            if [ -f "$test_binary" ] && [ -x "$test_binary" ]; then
+              sudo "$test_binary" --ignored --exact tests::service_group_can_read_downloads_after_renewal
+              found=true
+            fi
+          done
+          "$found"
       - name: Qualify real systemd update and rollback
         run: sudo env CERTKITE_DISPOSABLE_VM=1 python3 packaging/tests/linux-systemd.py
       - name: Collect service logs

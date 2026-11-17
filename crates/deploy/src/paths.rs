@@ -113,18 +113,25 @@ pub(crate) fn directory(path: &Path) -> Result<()> {
     directory_with(path, 0o700, None)
 }
 
-pub(crate) fn set_directory_access(path: &Path, mode: u32, group: Option<u32>) -> Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    if let Some(gid) = group {
+pub(crate) fn set_access(path: &Path, mode: u32, group: Option<u32>) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    let group_changed = group.is_some_and(|gid| metadata.gid() != gid);
+    if !group_changed && metadata.mode() & 0o7777 == mode {
+        return Ok(());
+    }
+    if let Some(gid) = group.filter(|_| group_changed) {
+        // Revoke the old group's access only when changing the authorized readers.
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o700))?;
         chown(path, gid)?;
     }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
 pub(crate) fn directory_with(path: &Path, mode: u32, group: Option<u32>) -> Result<()> {
     match fs::create_dir(path) {
         Ok(()) => {
-            set_directory_access(path, mode, group)?;
+            set_access(path, mode, group)?;
             sync(path.parent().context("missing parent")?)?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
