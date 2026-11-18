@@ -4,12 +4,12 @@ use crate::{
     config::{Config, STATE_DIR, VERSION},
     identity::Identity,
     state::{self, RuntimeStatus},
-    transport::{self, Socket},
+    transport::{self, Connection, Socket, send},
 };
 use anyhow::{Context, Result, bail, ensure};
 use certkite_protocol::{
-    ClientMessage, ErrorCode, MAX_MESSAGE_BYTES, OperationResult, PROTOCOL_VERSION, ResultStatus,
-    ServerMessage, TargetSummary,
+    ClientMessage, ErrorCode, OperationResult, PROTOCOL_VERSION, ResultStatus, ServerMessage,
+    TargetSummary,
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -62,7 +62,8 @@ pub async fn run_with_logs(
         .context("another client is already running")?;
     crate::update::recover_pending()?;
     let identity = Identity::load_or_create(&directory)?;
-    encode(&hello_message(&identity, &targets)?)?;
+    let client_id = identity.client_id.to_string();
+    transport::encode(&hello_message(&identity, &targets)?)?;
     let recovery_targets = targets.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         // The singleton protects startup recovery. An updater may hold deployment.lock
@@ -111,30 +112,53 @@ pub async fn run_with_logs(
                 return Ok(());
             }
             let connection = tokio::select! {
-                result = transport::connect(transport::CONNECT_URL, config.access_key()) => result,
+                result = transport::connect_core(config.access_key(), &client_id) => result,
                 _ = shutdown.changed() => return Ok(()),
             };
             match connection {
-                Ok(socket) => {
+                Ok(connection) => {
                     let started = Instant::now();
-                    if let Err(error) = session(
-                        socket,
-                        config.clone(),
-                        targets.clone(),
-                        &identity,
-                        &directory,
-                        &mut status,
-                        shutdown.clone(),
-                    )
-                    .await
-                    {
+                    let result = match connection {
+                        Connection::DeployV2(socket) => {
+                            crate::core_v2::session(
+                                socket,
+                                &client_id,
+                                crate::core_v2::DeploymentContext {
+                                    config: config.clone(),
+                                    targets: targets.clone(),
+                                    directory: directory.clone(),
+                                    certificate_root: PathBuf::from(
+                                        certkite_deploy::CERTIFICATE_ROOT,
+                                    ),
+                                },
+                                &mut status,
+                                shutdown.clone(),
+                            )
+                            .await
+                        }
+                        Connection::ClientV1(socket) => {
+                            session(
+                                socket,
+                                config.clone(),
+                                targets.clone(),
+                                &identity,
+                                &directory,
+                                &mut status,
+                                shutdown.clone(),
+                            )
+                            .await
+                        }
+                    };
+                    if let Err(error) = result {
                         tracing::warn!(error = %error, "connection ended");
                     }
                     if started.elapsed() > Duration::from_secs(60) {
                         failures = 0;
                     }
                 }
-                Err(_) => tracing::warn!("connection failed; check network and accessKey"),
+                Err(error) => {
+                    tracing::warn!(error = %error, "connection failed; check network and accessKey")
+                }
             }
             status.connected = false;
             status.updated_at = state::now()?;
@@ -190,30 +214,10 @@ async fn shutdown_signal() -> Result<()> {
     Ok(())
 }
 
-async fn save_status(directory: &Path, status: &RuntimeStatus) -> Result<()> {
+pub(crate) async fn save_status(directory: &Path, status: &RuntimeStatus) -> Result<()> {
     let path = directory.join("startup.json");
     let status = status.clone();
     tokio::task::spawn_blocking(move || state::write_json(&path, &status)).await?
-}
-
-fn encode(message: &ClientMessage) -> Result<String> {
-    let encoded = serde_json::to_string(message)?;
-    ensure!(
-        encoded.len() <= MAX_MESSAGE_BYTES,
-        "outbound protocol message exceeds {MAX_MESSAGE_BYTES} bytes"
-    );
-    Ok(encoded)
-}
-
-async fn send(socket: &mut Socket, message: &ClientMessage) -> Result<()> {
-    let encoded = encode(message)?;
-    timeout(
-        Duration::from_secs(10),
-        socket.send(Message::Text(encoded.into())),
-    )
-    .await
-    .context("server write timed out")?
-    .map_err(|_| anyhow::anyhow!("server connection closed while writing"))
 }
 
 pub(crate) async fn session(
@@ -323,7 +327,7 @@ async fn receive_welcome(socket: &mut Socket) -> Result<u64> {
     bail!("registration connection closed")
 }
 
-fn failed_result(
+pub(crate) fn failed_result(
     message: &ServerMessage,
     code: ErrorCode,
     retryable: bool,
@@ -360,7 +364,7 @@ fn failed_result(
     }
 }
 
-fn domain_matches(site: &str, domain: &str) -> bool {
+pub(crate) fn domain_matches(site: &str, domain: &str) -> bool {
     let site = site.trim_end_matches('.').to_ascii_lowercase();
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
     if site == domain {
@@ -379,6 +383,17 @@ fn execute(
     targets: &BTreeMap<String, certkite_deploy::TargetConfig>,
     directory: &Path,
     certificate_root: &Path,
+) -> OperationResult {
+    execute_ordered(message, config, targets, directory, certificate_root, false)
+}
+
+pub(crate) fn execute_ordered(
+    message: ServerMessage,
+    config: &Config,
+    targets: &BTreeMap<String, certkite_deploy::TargetConfig>,
+    directory: &Path,
+    certificate_root: &Path,
+    core_v2: bool,
 ) -> OperationResult {
     let mut result = failed_result(
         &message,
@@ -473,17 +488,19 @@ fn execute(
                 certkite_deploy::prepare_certificate_root(&certificate_root.join("downloads"))?;
                 target.prepare()?;
             }
-            certkite_deploy::deploy(
-                target,
-                &certkite_deploy::Deployment {
-                    operation_id,
-                    generation: *generation,
-                    domain,
-                    fullchain_pem,
-                    private_key_pem,
-                },
-            )
-            .map(|outcome| (outcome.changed, Some(outcome.generation)))
+            let request = certkite_deploy::Deployment {
+                operation_id,
+                generation: *generation,
+                domain,
+                fullchain_pem,
+                private_key_pem,
+            };
+            let outcome = if core_v2 {
+                certkite_deploy::deploy_core_v2(target, &request)
+            } else {
+                certkite_deploy::deploy(target, &request)
+            }?;
+            Ok((outcome.changed, Some(outcome.generation)))
         })(),
         _ => unreachable!("executor receives operations only"),
     };
@@ -563,7 +580,7 @@ fn hello_message(
     })
 }
 
-fn hostname() -> Result<String> {
+pub(crate) fn hostname() -> Result<String> {
     let mut bytes = [0u8; 256];
     // SAFETY: the pointer references a writable buffer of the supplied length.
     let code = unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) };
@@ -600,7 +617,8 @@ fn notify_ready() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{domain_matches, encode, execute, hello_message};
+    use super::{domain_matches, execute, hello_message};
+    use crate::transport::encode;
     use crate::{config::Config, identity::Identity, session_tests::certificate, state};
     use certkite_deploy::TargetConfig;
     use certkite_protocol::{ErrorCode, ResultStatus, ServerMessage};

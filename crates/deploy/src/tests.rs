@@ -138,6 +138,27 @@ fn publish_deduplicate_and_generations() {
 }
 
 #[test]
+fn v1_and_core_v2_keep_independent_generations_in_the_same_journal() {
+    let root = dir();
+    let target = TargetConfig::Files {
+        directory: root.path().into(),
+    };
+    let (cert, key) = certificate(&["a.example.com"]);
+    let v1_request = request("task-3", 100, &cert, &key);
+    let v2_request = request("task-3", 3, &cert, &key);
+
+    let v1 = deploy(&target, &v1_request).unwrap();
+    let v2 = deploy_core_v2(&target, &v2_request).unwrap();
+    assert_eq!(deploy(&target, &v1_request).unwrap(), v1);
+    assert_eq!(deploy_core_v2(&target, &v2_request).unwrap(), v2);
+
+    let err = deploy_core_v2(&target, &request("task-2", 2, &cert, &key)).unwrap_err();
+    assert_eq!(classify(&err), Failure::StaleOperation);
+    deploy(&target, &request("next-v1", 101, &cert, &key)).unwrap();
+    deploy_core_v2(&target, &request("task-4", 4, &cert, &key)).unwrap();
+}
+
+#[test]
 fn file_group_access_survives_renewal_and_can_be_revoked() {
     let root = dir();
     let directory = root.path().join("downloads");

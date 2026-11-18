@@ -465,6 +465,25 @@ fn hash(parts: &[&[u8]]) -> String {
     hex::encode(h.finalize())
 }
 pub fn deploy(target: &TargetConfig, request: &Deployment<'_>) -> Result<DeploymentOutcome> {
+    deploy_ordered(target, request, false)
+}
+
+/// Publish a deployment ordered by Core's task IDs, independent of client/v1 generations.
+pub fn deploy_core_v2(
+    target: &TargetConfig,
+    request: &Deployment<'_>,
+) -> Result<DeploymentOutcome> {
+    deploy_ordered(target, request, true)
+}
+
+// Control characters are reserved for internal journal keys by the public operation ID rules.
+const CORE_V2_OPERATION_PREFIX: &str = "\u{1}core-v2:";
+
+fn deploy_ordered(
+    target: &TargetConfig,
+    request: &Deployment<'_>,
+    core_v2: bool,
+) -> Result<DeploymentOutcome> {
     ensure!(
         !request.operation_id.is_empty()
             && request.operation_id.len() <= 256
@@ -484,7 +503,23 @@ pub fn deploy(target: &TargetConfig, request: &Deployment<'_>) -> Result<Deploym
     let _locks = locks(target)?;
     let mut state = state(target).context(Failure::RecoveryFailed)?;
     recover_locked(target, &mut state).context(Failure::RecoveryFailed)?;
-    if let Some(op) = state.operations.get(request.operation_id) {
+    let operation_id = if core_v2 {
+        format!("{CORE_V2_OPERATION_PREFIX}{}", request.operation_id)
+    } else {
+        request.operation_id.to_owned()
+    };
+    let last_generation = if core_v2 {
+        state
+            .operations
+            .iter()
+            .filter(|(id, _)| id.starts_with(CORE_V2_OPERATION_PREFIX))
+            .map(|(_, operation)| operation.outcome.generation)
+            .max()
+            .unwrap_or_default()
+    } else {
+        state.generation
+    };
+    if let Some(op) = state.operations.get(&operation_id) {
         ensure!(op.digest == digest, Failure::Conflict);
         if op.committed {
             let outcome = op.outcome.clone();
@@ -492,12 +527,12 @@ pub fn deploy(target: &TargetConfig, request: &Deployment<'_>) -> Result<Deploym
             return Ok(outcome);
         }
         ensure!(
-            request.generation == state.generation,
+            request.generation == last_generation,
             Failure::StaleOperation
         );
     } else {
         ensure!(
-            request.generation > state.generation,
+            request.generation > last_generation,
             Failure::StaleOperation
         );
     }
@@ -520,9 +555,11 @@ pub fn deploy(target: &TargetConfig, request: &Deployment<'_>) -> Result<Deploym
         fingerprint,
     };
     publish_version(target, &next, request)?;
-    state.generation = request.generation;
+    if !core_v2 {
+        state.generation = request.generation;
+    }
     state.operations.insert(
-        request.operation_id.to_owned(),
+        operation_id.clone(),
         Operation {
             digest,
             outcome: outcome.clone(),
@@ -531,17 +568,19 @@ pub fn deploy(target: &TargetConfig, request: &Deployment<'_>) -> Result<Deploym
     );
     // Retransmissions outside this bounded window are rejected by the durable
     // generation fence; retained operations return their original outcome.
-    while state.operations.len() > 256 {
+    let in_protocol = |id: &str| id.starts_with(CORE_V2_OPERATION_PREFIX) == core_v2;
+    if state.operations.keys().filter(|id| in_protocol(id)).count() > 256 {
         let oldest = state
             .operations
             .iter()
+            .filter(|(id, _)| in_protocol(id))
             .min_by_key(|(_, op)| op.outcome.generation)
             .map(|(id, _)| id.clone())
             .context("missing oldest operation")?;
         state.operations.remove(&oldest);
     }
     state.pending = Some(Pending {
-        operation_id: request.operation_id.to_owned(),
+        operation_id: operation_id.clone(),
         previous: previous.clone(),
         next: next.clone(),
     });
@@ -564,11 +603,7 @@ pub fn deploy(target: &TargetConfig, request: &Deployment<'_>) -> Result<Deploym
             .context(Failure::RecoveryFailed)),
         };
     }
-    state
-        .operations
-        .get_mut(request.operation_id)
-        .unwrap()
-        .committed = true;
+    state.operations.get_mut(&operation_id).unwrap().committed = true;
     state.pending = None;
     if changed {
         state.previous_version = previous;

@@ -1,6 +1,7 @@
 //! CertKite client runtime. The server origin is fixed and Core remains independent.
 
 pub mod config;
+mod core_v2;
 pub mod daemon;
 pub mod identity;
 pub mod logging;

@@ -55,13 +55,15 @@ the running user. The optional `downloadGroup` field accepts a numeric local gro
 ID and authorizes that group to read download-only certificates and private keys.
 Unknown fields, including manual `targets`, are rejected. The endpoint has no runtime override.
 
-Each discovered virtual host is a separate authorization boundary. The client
-reports its target ID, service kind and configured domains to Core without exposing
-local paths. Core binds a certificate to that exact target; a deployment is rejected
-when its domain does not match the selected local site. When the requested target
-is absent from local discovery, the client validates and saves the certificate
-without editing web-server configuration or reloading a service. The result reports
-success with a message explaining that deployment was skipped.
+With Core v2, the client selects a discovered Nginx or Caddy virtual host by
+certificate domain and deploys only when exactly one site matches. The certificate
+must cover all domains on that site. Core's file-only target saves certificates under
+the managed `downloads` directory by domain and applies the configured `downloadGroup`.
+
+With `/client/v1/connect`, the client reports each target's ID, kind and domains
+without exposing local paths. Core binds the certificate to an exact target ID.
+If that target is absent, the client validates and saves the certificate and
+reports that deployment was skipped.
 
 ## Install and operate
 
@@ -112,11 +114,12 @@ installs a locally obtained binary whose digest you independently verified. The
 script does not fetch binaries, accept credentials in arguments or overwrite a
 different installed version.
 
-First startup generates a persistent random client ID. Connecting with accessKey
-registers or refreshes that server in Core. There is no enroll/unenroll command.
-The deployment connection sends the access key in a sensitive `Authorization`
-header over verified TLS. Credentials and private keys are excluded from protocol
-Debug output.
+First startup generates a persistent random client ID. The daemon registers with
+Core when it connects and refreshes that registration on each reconnect. There
+is no enroll/unenroll command. `certkite status` reports the connection as active
+after Core acknowledges registration. `certkite doctor` verifies the access key
+using the certificate-list OpenAPI with Bearer authentication. If that route
+returns HTTP 404 or 405, it uses the `/client/v1/identity` endpoint.
 
 ```text
 certkite status [--json]
@@ -277,12 +280,16 @@ release publishing, inspection and interrupted-update recovery.
 
 ## Core integration
 
-Core must implement the [public protocol](docs/protocol.md), including the new
-`/client/v1/` endpoints, server registration, authorization, monotonically increasing
-per-target generations and deployment scheduling. These endpoints are a separate
-contract from the existing `/deploy/v2/ws` protocol; this client does not fall back
-to legacy protocols or send account credentials in URLs. A Core deployment without
-the adapter cannot register this client or provide update metadata.
+Core v2 registration, heartbeats, and certificate deployments use
+`wss://certkite.com/deploy/v2/ws` with the client ID in the query string and the
+access key in the TLS handshake's `Authorization: Bearer` header. Deploy the Core
+backend with Bearer handshake support and v2 task generations before rolling
+out the client. Reverse proxies must forward the `Authorization` header.
+
+If the v2 handshake returns HTTP 404 or 401, the client tries the
+`/client/v1/connect` endpoint with Bearer authentication. Both protocols reject
+older deployments within their own generation sequence. Signed updates use
+the `/client/v1/releases/` endpoints.
 
 The workspace test suite runs against local mock services and needs no private
 repository, production accessKey or real certificate issuance.
