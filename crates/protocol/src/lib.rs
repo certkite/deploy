@@ -1,58 +1,16 @@
-//! Public JSON wire contract for CertKite clients. No Core source is required.
+//! Local deployment commands, validation limits and operation results.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// First supported protocol major version.
-pub const PROTOCOL_VERSION: u32 = 1;
 /// Maximum size of a WebSocket message, including certificate material.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Maximum size of either PEM field.
 pub const MAX_PEM_BYTES: usize = 256 * 1024;
 
-/// A locally configured deployment capability; paths and secrets stay local.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct TargetSummary {
-    pub id: String,
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub domains: Vec<String>,
-}
-
-/// Messages sent by the client. Deliberately does not implement Debug.
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientMessage {
-    Hello {
-        protocol_version: u32,
-        client_id: String,
-        client_version: String,
-        build_id: String,
-        os: String,
-        arch: String,
-        hostname: String,
-        targets: Vec<TargetSummary>,
-    },
-    Heartbeat {
-        client_id: String,
-        timestamp: u64,
-    },
-    Result {
-        client_id: String,
-        #[serde(flatten)]
-        result: OperationResult,
-    },
-}
-
-/// Messages accepted from Core. Secret-bearing payloads do not implement Debug.
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerMessage {
-    Welcome {
-        protocol_version: u32,
-        heartbeat_seconds: u64,
-    },
-    Heartbeat {},
+/// A local command translated from a Core deployment request.
+/// Secret-bearing commands do not implement Debug.
+pub enum DeploymentCommand {
     Test {
         request_id: String,
         target: String,
@@ -66,12 +24,6 @@ pub enum ServerMessage {
         fullchain_pem: String,
         private_key_pem: String,
     },
-    Error {
-        code: String,
-        message: String,
-    },
-    #[serde(other)]
-    Unknown,
 }
 
 /// Final result for a test or deployment operation.
@@ -115,9 +67,9 @@ pub enum ErrorCode {
     Unsupported,
 }
 
-/// Invalid wire input, without including the original secret-bearing input.
+/// Invalid deployment input, without including the original secret-bearing input.
 #[derive(Debug, Error, PartialEq, Eq)]
-#[error("invalid protocol message: {0}")]
+#[error("invalid deployment command: {0}")]
 pub struct ValidationError(pub &'static str);
 
 /// Validate an opaque local target or operation identifier.
@@ -129,7 +81,7 @@ pub fn valid_id(value: &str, maximum: usize) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
-impl ServerMessage {
+impl DeploymentCommand {
     /// Apply bounds before dispatch or allocation of deployment work.
     pub fn validate(&self) -> Result<(), ValidationError> {
         let validate_target = |request: &str, target: &str| {
@@ -139,14 +91,6 @@ impl ServerMessage {
             Ok(())
         };
         match self {
-            Self::Welcome {
-                protocol_version,
-                heartbeat_seconds,
-            } => {
-                if *protocol_version != PROTOCOL_VERSION || !(5..=120).contains(heartbeat_seconds) {
-                    return Err(ValidationError("unsupported version or heartbeat interval"));
-                }
-            }
             Self::Test { request_id, target } => validate_target(request_id, target)?,
             Self::Deploy {
                 request_id,
@@ -180,13 +124,6 @@ impl ServerMessage {
                     return Err(ValidationError("invalid PEM length"));
                 }
             }
-            Self::Error { code, message } => {
-                if !valid_id(code, 64) || message.len() > 1024 {
-                    return Err(ValidationError("invalid error response"));
-                }
-            }
-            Self::Unknown => return Err(ValidationError("unsupported message type")),
-            Self::Heartbeat {} => {}
         }
         Ok(())
     }
@@ -197,50 +134,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secret_payload_round_trips_without_protocol_drift() {
-        let json = r#"{"type":"deploy","request_id":"req_1","operation_id":"op_1","target":"web","generation":2,"domain":"example.com","fullchain_pem":"certificate","private_key_pem":"secret","future_field":true}"#;
-        let message: ServerMessage = serde_json::from_str(json).unwrap();
-        message.validate().unwrap();
-        let encoded = serde_json::to_value(message).unwrap();
-        assert_eq!(encoded["type"], "deploy");
-        assert_eq!(encoded["generation"], 2);
-        assert_eq!(encoded["private_key_pem"], "secret");
-    }
-
-    #[test]
     fn rejects_paths_oversized_material_and_zero_generations() {
-        let mut value = serde_json::json!({"type":"deploy","request_id":"req","operation_id":"op","target":"../web","generation":1,"domain":"example.com","fullchain_pem":"cert","private_key_pem":"key"});
-        assert!(
-            serde_json::from_value::<ServerMessage>(value.clone())
-                .unwrap()
-                .validate()
-                .is_err()
-        );
-        value["target"] = "web".into();
-        value["generation"] = 0.into();
-        assert!(
-            serde_json::from_value::<ServerMessage>(value.clone())
-                .unwrap()
-                .validate()
-                .is_err()
-        );
-        value["generation"] = 1.into();
-        value["private_key_pem"] = "x".repeat(MAX_PEM_BYTES + 1).into();
-        assert!(
-            serde_json::from_value::<ServerMessage>(value)
-                .unwrap()
-                .validate()
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn unknown_messages_are_explicitly_unsupported() {
-        let message: ServerMessage =
-            serde_json::from_str(r#"{"type":"execute_shell","command":"anything"}"#).unwrap();
-        assert_eq!(
-            message.validate(),
-            Err(ValidationError("unsupported message type"))
-        );
+        for (target, generation, key, valid) in [
+            ("web", 1, "key".into(), true),
+            ("../web", 1, "key".into(), false),
+            ("web", 0, "key".into(), false),
+            ("web", 1, "x".repeat(MAX_PEM_BYTES + 1), false),
+        ] {
+            let command = DeploymentCommand::Deploy {
+                request_id: "req".into(),
+                operation_id: "task-1".into(),
+                target: target.into(),
+                generation,
+                domain: "example.com".into(),
+                fullchain_pem: "cert".into(),
+                private_key_pem: key,
+            };
+            assert_eq!(command.validate().is_ok(), valid);
+        }
     }
 }

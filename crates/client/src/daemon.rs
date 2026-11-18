@@ -2,16 +2,14 @@
 
 use crate::{
     config::{Config, STATE_DIR, VERSION},
+    core::{self, DeploymentContext},
     identity::Identity,
     state::{self, RuntimeStatus},
-    transport::{self, Connection, Socket, send},
+    transport,
 };
-use anyhow::{Context, Result, bail, ensure};
-use certkite_protocol::{
-    ClientMessage, ErrorCode, OperationResult, PROTOCOL_VERSION, ResultStatus, ServerMessage,
-    TargetSummary,
-};
-use futures_util::{SinkExt, StreamExt};
+use anyhow::{Context, Result, ensure};
+use certkite_deploy::TargetConfig;
+use certkite_protocol::{DeploymentCommand, ErrorCode, OperationResult, ResultStatus};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -20,10 +18,8 @@ use std::{
 };
 use tokio::{
     sync::watch,
-    task::JoinSet,
-    time::{Instant, interval, timeout},
+    time::{Instant, timeout},
 };
-use tokio_tungstenite::tungstenite::Message;
 
 /// Build identity embedded by the release workflow.
 pub fn build_id() -> &'static str {
@@ -63,7 +59,6 @@ pub async fn run_with_logs(
     crate::update::recover_pending()?;
     let identity = Identity::load_or_create(&directory)?;
     let client_id = identity.client_id.to_string();
-    transport::encode(&hello_message(&identity, &targets)?)?;
     let recovery_targets = targets.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         // The singleton protects startup recovery. An updater may hold deployment.lock
@@ -105,6 +100,12 @@ pub async fn run_with_logs(
         ))
     });
     tracing::info!(version = VERSION, targets = targets.len(), "client started");
+    let deployment = DeploymentContext {
+        config: config.clone(),
+        targets,
+        directory: directory.clone(),
+        certificate_root: PathBuf::from(certkite_deploy::CERTIFICATE_ROOT),
+    };
     let mut failures = 0u32;
     let outcome = async {
         loop {
@@ -116,39 +117,16 @@ pub async fn run_with_logs(
                 _ = shutdown.changed() => return Ok(()),
             };
             match connection {
-                Ok(connection) => {
+                Ok(socket) => {
                     let started = Instant::now();
-                    let result = match connection {
-                        Connection::DeployV2(socket) => {
-                            crate::core_v2::session(
-                                socket,
-                                &client_id,
-                                crate::core_v2::DeploymentContext {
-                                    config: config.clone(),
-                                    targets: targets.clone(),
-                                    directory: directory.clone(),
-                                    certificate_root: PathBuf::from(
-                                        certkite_deploy::CERTIFICATE_ROOT,
-                                    ),
-                                },
-                                &mut status,
-                                shutdown.clone(),
-                            )
-                            .await
-                        }
-                        Connection::ClientV1(socket) => {
-                            session(
-                                socket,
-                                config.clone(),
-                                targets.clone(),
-                                &identity,
-                                &directory,
-                                &mut status,
-                                shutdown.clone(),
-                            )
-                            .await
-                        }
-                    };
+                    let result = core::session(
+                        socket,
+                        &client_id,
+                        deployment.clone(),
+                        &mut status,
+                        shutdown.clone(),
+                    )
+                    .await;
                     if let Err(error) = result {
                         tracing::warn!(error = %error, "connection ended");
                     }
@@ -220,124 +198,17 @@ pub(crate) async fn save_status(directory: &Path, status: &RuntimeStatus) -> Res
     tokio::task::spawn_blocking(move || state::write_json(&path, &status)).await?
 }
 
-pub(crate) async fn session(
-    mut socket: Socket,
-    config: Arc<Config>,
-    targets: Arc<BTreeMap<String, certkite_deploy::TargetConfig>>,
-    identity: &Identity,
-    directory: &Path,
-    status: &mut RuntimeStatus,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let client_id = identity.client_id.to_string();
-    send(&mut socket, &hello_message(identity, &targets)?).await?;
-    let greeting = tokio::select! {
-        result = timeout(Duration::from_secs(15), receive_welcome(&mut socket)) => result.context("registration timed out")??,
-        _ = shutdown.changed() => return Ok(()),
-    };
-    tracing::info!("connected to Core");
-    status.connected = true;
-    status.last_seen_at = Some(state::now()?);
-    status.updated_at = state::now()?;
-    save_status(directory, status).await?;
-    let mut heartbeat = interval(Duration::from_secs(greeting));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_received = Instant::now();
-    let mut work: JoinSet<OperationResult> = JoinSet::new();
-    let outcome: Result<()> = async {
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => { break; },
-                _ = heartbeat.tick() => {
-                    ensure!(last_received.elapsed() < Duration::from_secs(greeting * 3), "server heartbeat timed out");
-                    send(&mut socket, &ClientMessage::Heartbeat { client_id: client_id.clone(), timestamp: state::now()? }).await?;
-                },
-                result = work.join_next(), if !work.is_empty() => {
-                    let result = result.context("operation task disappeared")?.context("operation task failed")?;
-                    status.last_result = Some(result.clone());
-                    status.updated_at = state::now()?;
-                    save_status(directory, status).await?;
-                    send(&mut socket, &ClientMessage::Result { client_id: client_id.clone(), result }).await?;
-                },
-                incoming = socket.next() => {
-                    let frame = incoming.context("server disconnected")?.map_err(|_| anyhow::anyhow!("WebSocket read failed"))?;
-                    match frame {
-                        Message::Ping(payload) => {
-                            timeout(Duration::from_secs(10), socket.send(Message::Pong(payload))).await??;
-                            last_received = Instant::now();
-                            continue;
-                        },
-                        Message::Pong(_) => { last_received = Instant::now(); continue; },
-                        Message::Close(_) => break,
-                        Message::Text(text) => {
-                            let message = transport::decode(&text)?;
-                            last_received = Instant::now();
-                            status.last_seen_at = Some(state::now()?);
-                            match message {
-                                ServerMessage::Heartbeat {} => {},
-                                ServerMessage::Deploy { .. } | ServerMessage::Test { .. } => {
-                                    if !work.is_empty() {
-                                        let result = failed_result(&message, ErrorCode::Busy, true, "another operation is running");
-                                        send(&mut socket, &ClientMessage::Result { client_id: client_id.clone(), result }).await?;
-                                    } else {
-                                        if let ServerMessage::Deploy { request_id, target, .. } | ServerMessage::Test { request_id, target } = &message {
-                                            tracing::info!(%request_id, %target, "operation started");
-                                        }
-                                        let config = config.clone();
-                                        let targets = targets.clone();
-                                        let directory = directory.to_owned();
-                                        work.spawn_blocking(move || execute(message, &config, &targets, &directory, Path::new(certkite_deploy::CERTIFICATE_ROOT)));
-                                    }
-                                },
-                                ServerMessage::Error { .. } => bail!("server rejected the session"),
-                                _ => bail!("unexpected server message after registration"),
-                            }
-                        },
-                        _ => bail!("only JSON text messages are supported"),
-                    }
-                }
-            }
-        }
-        Ok(())
-    }.await;
-    // Dropping spawn_blocking cannot cancel file publication; always wait for its result.
-    while let Some(result) = work.join_next().await {
-        let result = result.context("deployment task failed during disconnect")?;
-        status.last_result = Some(result);
-        status.updated_at = state::now()?;
-        save_status(directory, status).await?;
-    }
-    outcome
-}
-
-async fn receive_welcome(socket: &mut Socket) -> Result<u64> {
-    while let Some(frame) = socket.next().await {
-        match frame.map_err(|_| anyhow::anyhow!("registration connection failed"))? {
-            Message::Text(text) => match transport::decode(&text)? {
-                ServerMessage::Welcome {
-                    heartbeat_seconds, ..
-                } => return Ok(heartbeat_seconds),
-                _ => bail!("first server message must be welcome"),
-            },
-            Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
-            Message::Pong(_) => {}
-            _ => bail!("registration connection closed"),
-        }
-    }
-    bail!("registration connection closed")
-}
-
 pub(crate) fn failed_result(
-    message: &ServerMessage,
+    message: &DeploymentCommand,
     code: ErrorCode,
     retryable: bool,
     explanation: &str,
 ) -> OperationResult {
     let (request_id, target, operation_id, generation) = match message {
-        ServerMessage::Test { request_id, target } => {
+        DeploymentCommand::Test { request_id, target } => {
             (request_id.clone(), target.clone(), None, None)
         }
-        ServerMessage::Deploy {
+        DeploymentCommand::Deploy {
             request_id,
             target,
             operation_id,
@@ -349,7 +220,6 @@ pub(crate) fn failed_result(
             Some(operation_id.clone()),
             Some(*generation),
         ),
-        _ => unreachable!("only validated operations reach the executor"),
     };
     OperationResult {
         request_id,
@@ -377,23 +247,12 @@ pub(crate) fn domain_matches(site: &str, domain: &str) -> bool {
         && domain.matches('.').count() == root.matches('.').count() + 1
 }
 
-fn execute(
-    message: ServerMessage,
+pub(crate) fn execute(
+    message: DeploymentCommand,
     config: &Config,
-    targets: &BTreeMap<String, certkite_deploy::TargetConfig>,
+    target: Option<&TargetConfig>,
     directory: &Path,
     certificate_root: &Path,
-) -> OperationResult {
-    execute_ordered(message, config, targets, directory, certificate_root, false)
-}
-
-pub(crate) fn execute_ordered(
-    message: ServerMessage,
-    config: &Config,
-    targets: &BTreeMap<String, certkite_deploy::TargetConfig>,
-    directory: &Path,
-    certificate_root: &Path,
-    core_v2: bool,
 ) -> OperationResult {
     let mut result = failed_result(
         &message,
@@ -427,11 +286,11 @@ pub(crate) fn execute_ordered(
     if pending.exists() {
         return failed_result(&message, ErrorCode::Busy, true, "client is updating");
     }
-    let download_only = !targets.contains_key(&result.target);
+    let download_only = target.is_none();
     let files;
-    let target = match targets.get(&result.target) {
+    let target = match target {
         Some(target) => target,
-        None if matches!(&message, ServerMessage::Deploy { .. }) => {
+        None if matches!(&message, DeploymentCommand::Deploy { .. }) => {
             if !certkite_protocol::valid_id(&result.target, 64) {
                 return failed_result(
                     &message,
@@ -443,11 +302,11 @@ pub(crate) fn execute_ordered(
             // Keep downloads away from service journals and configuration backups.
             let directory = certificate_root.join("downloads").join(&result.target);
             files = match config.download_group {
-                Some(service_group) => certkite_deploy::TargetConfig::SharedFiles {
+                Some(service_group) => TargetConfig::SharedFiles {
                     directory,
                     service_group,
                 },
-                None => certkite_deploy::TargetConfig::Files { directory },
+                None => TargetConfig::Files { directory },
             };
             &files
         }
@@ -460,7 +319,7 @@ pub(crate) fn execute_ordered(
             );
         }
     };
-    if let ServerMessage::Deploy { domain, .. } = &message
+    if let DeploymentCommand::Deploy { domain, .. } = &message
         && !target.domains().is_empty()
         && !target
             .domains()
@@ -475,8 +334,8 @@ pub(crate) fn execute_ordered(
         );
     }
     let outcome = match &message {
-        ServerMessage::Test { .. } => certkite_deploy::check(target).map(|()| (false, None)),
-        ServerMessage::Deploy {
+        DeploymentCommand::Test { .. } => certkite_deploy::check(target).map(|()| (false, None)),
+        DeploymentCommand::Deploy {
             operation_id,
             generation,
             domain,
@@ -495,21 +354,16 @@ pub(crate) fn execute_ordered(
                 fullchain_pem,
                 private_key_pem,
             };
-            let outcome = if core_v2 {
-                certkite_deploy::deploy_core_v2(target, &request)
-            } else {
-                certkite_deploy::deploy(target, &request)
-            }?;
+            let outcome = certkite_deploy::deploy(target, &request)?;
             Ok((outcome.changed, Some(outcome.generation)))
         })(),
-        _ => unreachable!("executor receives operations only"),
     };
     match outcome {
         Ok((changed, generation)) => {
             result.status = ResultStatus::Success;
             result.code = ErrorCode::Ok;
             result.message = if download_only {
-                "certificate downloaded; deployment skipped because target is not available"
+                "certificate saved to the download directory"
             } else {
                 "operation completed"
             }
@@ -557,29 +411,6 @@ pub(crate) fn execute_ordered(
     result
 }
 
-fn hello_message(
-    identity: &Identity,
-    targets: &BTreeMap<String, certkite_deploy::TargetConfig>,
-) -> Result<ClientMessage> {
-    Ok(ClientMessage::Hello {
-        protocol_version: PROTOCOL_VERSION,
-        client_id: identity.client_id.to_string(),
-        client_version: VERSION.into(),
-        build_id: build_id().into(),
-        os: std::env::consts::OS.into(),
-        arch: std::env::consts::ARCH.into(),
-        hostname: hostname()?,
-        targets: targets
-            .iter()
-            .map(|(id, target)| TargetSummary {
-                id: id.clone(),
-                kind: target.kind().into(),
-                domains: target.domains().to_vec(),
-            })
-            .collect(),
-    })
-}
-
 pub(crate) fn hostname() -> Result<String> {
     let mut bytes = [0u8; 256];
     // SAFETY: the pointer references a writable buffer of the supplied length.
@@ -617,19 +448,17 @@ fn notify_ready() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{domain_matches, execute, hello_message};
-    use crate::transport::encode;
-    use crate::{config::Config, identity::Identity, session_tests::certificate, state};
+    use super::{domain_matches, execute};
+    use crate::{config::Config, session_tests::certificate, state};
     use certkite_deploy::TargetConfig;
-    use certkite_protocol::{ErrorCode, ResultStatus, ServerMessage};
+    use certkite_protocol::{DeploymentCommand, ErrorCode, ResultStatus};
     use std::{
-        collections::BTreeMap,
         fs,
         os::unix::fs::{MetadataExt, PermissionsExt},
     };
 
     #[test]
-    fn unavailable_target_downloads_certificates_without_deploying_other_sites() {
+    fn file_only_operations_leave_service_files_untouched() {
         let (cert, key) = certificate();
         for (target_id, shared) in [("nginx", false), ("caddy", false), ("shared", true)] {
             let temp = tempfile::tempdir().unwrap();
@@ -671,19 +500,6 @@ mod tests {
             fs::set_permissions(&legacy, fs::Permissions::from_mode(legacy_mode)).unwrap();
             let journal = fs::read(legacy.join("state.json")).unwrap();
             let backup = fs::read(legacy.join("config-backup.json")).unwrap();
-            let mut targets = BTreeMap::new();
-            if target_id == "caddy" {
-                targets.insert(
-                    "other-site".into(),
-                    TargetConfig::NginxSite {
-                        directory: certificates.join("other-site"),
-                        nginx_binary: root.join("missing-nginx"),
-                        systemd_unit: "nginx.service".into(),
-                        config_file: config_file.clone(),
-                        domains: vec!["example.com".into()],
-                    },
-                );
-            }
             for (operation, generation, expected) in [
                 ("op_1", 2, ErrorCode::Ok),
                 ("op_1", 2, ErrorCode::Ok),
@@ -691,7 +507,7 @@ mod tests {
                 ("op_invalid", 3, ErrorCode::CertificateInvalid),
             ] {
                 let result = execute(
-                    ServerMessage::Deploy {
+                    DeploymentCommand::Deploy {
                         request_id: "req_1".into(),
                         operation_id: operation.into(),
                         target: target_id.into(),
@@ -705,7 +521,7 @@ mod tests {
                         },
                     },
                     &config,
-                    &targets,
+                    None,
                     &root,
                     &certificates,
                 );
@@ -722,7 +538,10 @@ mod tests {
                     }
                 );
                 if expected == ErrorCode::Ok {
-                    assert!(result.message.contains("deployment skipped"));
+                    assert_eq!(
+                        result.message,
+                        "certificate saved to the download directory"
+                    );
                     assert_eq!(result.generation, Some(generation));
                 }
             }
@@ -758,7 +577,6 @@ mod tests {
             );
             assert_eq!(fs::metadata(&legacy).unwrap().mode() & 0o777, legacy_mode);
             assert!(!legacy.join("current").exists());
-            assert!(!certificates.join("other-site").exists());
         }
     }
 
@@ -769,32 +587,35 @@ mod tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let certificates = root.join("certificates");
         let config: Config = toml::from_str("accessKey='test-key'").unwrap();
-        let targets = BTreeMap::from([(
-            "web".into(),
-            TargetConfig::NginxSite {
-                directory: certificates.join("web"),
-                nginx_binary: root.join("missing-nginx"),
-                systemd_unit: "nginx.service".into(),
-                config_file: root.join("nginx.conf"),
-                domains: vec!["other.example.com".into()],
-            },
-        )]);
-        for message in [
-            ServerMessage::Test {
-                request_id: "req_1".into(),
-                target: "missing".into(),
-            },
-            ServerMessage::Deploy {
-                request_id: "req_2".into(),
-                operation_id: "op_1".into(),
-                target: "web".into(),
-                generation: 1,
-                domain: "example.com".into(),
-                fullchain_pem: "cert".into(),
-                private_key_pem: "key".into(),
-            },
+        let target = TargetConfig::NginxSite {
+            directory: certificates.join("web"),
+            nginx_binary: root.join("missing-nginx"),
+            systemd_unit: "nginx.service".into(),
+            config_file: root.join("nginx.conf"),
+            domains: vec!["other.example.com".into()],
+        };
+        for (message, target) in [
+            (
+                DeploymentCommand::Test {
+                    request_id: "req_1".into(),
+                    target: "missing".into(),
+                },
+                None,
+            ),
+            (
+                DeploymentCommand::Deploy {
+                    request_id: "req_2".into(),
+                    operation_id: "op_1".into(),
+                    target: "web".into(),
+                    generation: 1,
+                    domain: "example.com".into(),
+                    fullchain_pem: "cert".into(),
+                    private_key_pem: "key".into(),
+                },
+                Some(&target),
+            ),
         ] {
-            let result = execute(message, &config, &targets, &root, &certificates);
+            let result = execute(message, &config, target, &root, &certificates);
             assert_eq!(result.status, ResultStatus::Failed);
             assert_eq!(result.code, ErrorCode::TargetUnavailable);
         }
@@ -807,35 +628,5 @@ mod tests {
         assert!(domain_matches("*.example.com", "api.example.com"));
         assert!(!domain_matches("*.example.com", "deep.api.example.com"));
         assert!(!domain_matches("example.com", "other.example.com"));
-    }
-
-    #[test]
-    fn outbound_messages_obey_the_protocol_size_limit() {
-        let identity = Identity {
-            client_id: uuid::Uuid::new_v4(),
-        };
-        let domain = format!(
-            "{}.{}.{}.{}",
-            "a".repeat(63),
-            "b".repeat(63),
-            "c".repeat(63),
-            "d".repeat(61)
-        );
-        let mut targets = BTreeMap::new();
-        for index in 0..64 {
-            targets.insert(
-                format!("nginx-{index:024}"),
-                certkite_deploy::TargetConfig::NginxSite {
-                    directory: "/fixture/certificates".into(),
-                    nginx_binary: "/usr/sbin/nginx".into(),
-                    systemd_unit: "nginx.service".into(),
-                    config_file: "/etc/nginx/nginx.conf".into(),
-                    domains: vec![domain.clone(); 128],
-                },
-            );
-        }
-        assert!(encode(&hello_message(&identity, &targets).unwrap()).is_err());
-        targets.retain(|id, _| id.ends_with("000000"));
-        assert!(encode(&hello_message(&identity, &targets).unwrap()).is_ok());
     }
 }

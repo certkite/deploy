@@ -305,7 +305,14 @@ pub struct DeploymentOutcome {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
-    generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_generation: Option<u64>,
+    #[serde(
+        rename = "generation",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    legacy_generation: Option<u64>,
     operations: BTreeMap<String, Operation>,
     pending: Option<Pending>,
     #[serde(default)]
@@ -464,26 +471,25 @@ fn hash(parts: &[&[u8]]) -> String {
     }
     hex::encode(h.finalize())
 }
+impl State {
+    fn migrate_core_receipts(&mut self) {
+        if self.legacy_generation.take().is_none() {
+            return;
+        }
+        // Earlier journals stored Core receipts under a prefix and tracked other
+        // receipts in a separate generation sequence. Recover pending work first.
+        const LEGACY_CORE_PREFIX: &str = "\u{1}core-v2:";
+        for (id, operation) in std::mem::take(&mut self.operations) {
+            if let Some(id) = id.strip_prefix(LEGACY_CORE_PREFIX) {
+                let generation = self.task_generation.unwrap_or_default();
+                self.task_generation = Some(generation.max(operation.outcome.generation));
+                self.operations.insert(id.to_owned(), operation);
+            }
+        }
+    }
+}
+
 pub fn deploy(target: &TargetConfig, request: &Deployment<'_>) -> Result<DeploymentOutcome> {
-    deploy_ordered(target, request, false)
-}
-
-/// Publish a deployment ordered by Core's task IDs, independent of client/v1 generations.
-pub fn deploy_core_v2(
-    target: &TargetConfig,
-    request: &Deployment<'_>,
-) -> Result<DeploymentOutcome> {
-    deploy_ordered(target, request, true)
-}
-
-// Control characters are reserved for internal journal keys by the public operation ID rules.
-const CORE_V2_OPERATION_PREFIX: &str = "\u{1}core-v2:";
-
-fn deploy_ordered(
-    target: &TargetConfig,
-    request: &Deployment<'_>,
-    core_v2: bool,
-) -> Result<DeploymentOutcome> {
     ensure!(
         !request.operation_id.is_empty()
             && request.operation_id.len() <= 256
@@ -503,23 +509,9 @@ fn deploy_ordered(
     let _locks = locks(target)?;
     let mut state = state(target).context(Failure::RecoveryFailed)?;
     recover_locked(target, &mut state).context(Failure::RecoveryFailed)?;
-    let operation_id = if core_v2 {
-        format!("{CORE_V2_OPERATION_PREFIX}{}", request.operation_id)
-    } else {
-        request.operation_id.to_owned()
-    };
-    let last_generation = if core_v2 {
-        state
-            .operations
-            .iter()
-            .filter(|(id, _)| id.starts_with(CORE_V2_OPERATION_PREFIX))
-            .map(|(_, operation)| operation.outcome.generation)
-            .max()
-            .unwrap_or_default()
-    } else {
-        state.generation
-    };
-    if let Some(op) = state.operations.get(&operation_id) {
+    state.migrate_core_receipts();
+    let last_generation = state.task_generation.unwrap_or_default();
+    if let Some(op) = state.operations.get(request.operation_id) {
         ensure!(op.digest == digest, Failure::Conflict);
         if op.committed {
             let outcome = op.outcome.clone();
@@ -555,11 +547,9 @@ fn deploy_ordered(
         fingerprint,
     };
     publish_version(target, &next, request)?;
-    if !core_v2 {
-        state.generation = request.generation;
-    }
+    state.task_generation = Some(request.generation);
     state.operations.insert(
-        operation_id.clone(),
+        request.operation_id.to_owned(),
         Operation {
             digest,
             outcome: outcome.clone(),
@@ -568,19 +558,17 @@ fn deploy_ordered(
     );
     // Retransmissions outside this bounded window are rejected by the durable
     // generation fence; retained operations return their original outcome.
-    let in_protocol = |id: &str| id.starts_with(CORE_V2_OPERATION_PREFIX) == core_v2;
-    if state.operations.keys().filter(|id| in_protocol(id)).count() > 256 {
+    if state.operations.len() > 256 {
         let oldest = state
             .operations
             .iter()
-            .filter(|(id, _)| in_protocol(id))
             .min_by_key(|(_, op)| op.outcome.generation)
             .map(|(id, _)| id.clone())
             .context("missing oldest operation")?;
         state.operations.remove(&oldest);
     }
     state.pending = Some(Pending {
-        operation_id: operation_id.clone(),
+        operation_id: request.operation_id.to_owned(),
         previous: previous.clone(),
         next: next.clone(),
     });
@@ -603,7 +591,11 @@ fn deploy_ordered(
             .context(Failure::RecoveryFailed)),
         };
     }
-    state.operations.get_mut(&operation_id).unwrap().committed = true;
+    state
+        .operations
+        .get_mut(request.operation_id)
+        .unwrap()
+        .committed = true;
     state.pending = None;
     if changed {
         state.previous_version = previous;

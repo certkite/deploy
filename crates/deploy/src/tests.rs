@@ -138,24 +138,55 @@ fn publish_deduplicate_and_generations() {
 }
 
 #[test]
-fn v1_and_core_v2_keep_independent_generations_in_the_same_journal() {
+fn older_journals_keep_core_receipts_and_task_ordering() {
     let root = dir();
     let target = TargetConfig::Files {
         directory: root.path().into(),
     };
     let (cert, key) = certificate(&["a.example.com"]);
-    let v1_request = request("task-3", 100, &cert, &key);
-    let v2_request = request("task-3", 3, &cert, &key);
+    let first = deploy(&target, &request("task-3", 3, &cert, &key)).unwrap();
+    let mut journal = state(&target).unwrap();
+    let receipt = journal.operations.remove("task-3").unwrap();
+    let mut unrelated = serde_json::to_value(&receipt).unwrap();
+    unrelated["outcome"]["generation"] = 100.into();
+    journal
+        .operations
+        .insert("task-4".into(), serde_json::from_value(unrelated).unwrap());
+    journal
+        .operations
+        .insert("\u{1}core-v2:task-3".into(), receipt);
+    let mut legacy = serde_json::to_value(&journal).unwrap();
+    legacy.as_object_mut().unwrap().remove("task_generation");
+    legacy["generation"] = 100.into();
+    paths::atomic(
+        &target.directory().join("state.json"),
+        &serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
 
-    let v1 = deploy(&target, &v1_request).unwrap();
-    let v2 = deploy_core_v2(&target, &v2_request).unwrap();
-    assert_eq!(deploy(&target, &v1_request).unwrap(), v1);
-    assert_eq!(deploy_core_v2(&target, &v2_request).unwrap(), v2);
+    assert_eq!(
+        deploy(&target, &request("task-3", 3, &cert, &key)).unwrap(),
+        first
+    );
+    let error = deploy(&target, &request("task-2", 2, &cert, &key)).unwrap_err();
+    assert_eq!(classify(&error), Failure::StaleOperation);
+    deploy(&target, &request("task-4", 4, &cert, &key)).unwrap();
 
-    let err = deploy_core_v2(&target, &request("task-2", 2, &cert, &key)).unwrap_err();
-    assert_eq!(classify(&err), Failure::StaleOperation);
-    deploy(&target, &request("next-v1", 101, &cert, &key)).unwrap();
-    deploy_core_v2(&target, &request("task-4", 4, &cert, &key)).unwrap();
+    let journal = state(&target).unwrap();
+    assert!(journal.legacy_generation.is_none());
+    assert_eq!(journal.task_generation, Some(4));
+    assert_eq!(
+        journal
+            .operations
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["task-3", "task-4"]
+    );
+    assert_eq!(
+        deploy(&target, &request("task-3", 3, &cert, &key)).unwrap(),
+        first
+    );
 }
 
 #[test]

@@ -2,13 +2,13 @@
 
 use crate::{
     config::{Config, VERSION},
-    daemon::{domain_matches, execute_ordered, failed_result, hostname, save_status},
+    daemon::{self, domain_matches, failed_result, hostname, save_status},
     state::{self, RuntimeStatus},
     transport::{self, Socket},
 };
 use anyhow::{Context, Result, bail, ensure};
 use certkite_deploy::TargetConfig;
-use certkite_protocol::{ErrorCode, OperationResult, ResultStatus, ServerMessage, valid_id};
+use certkite_protocol::{DeploymentCommand, ErrorCode, OperationResult, ResultStatus, valid_id};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -258,7 +258,7 @@ pub(crate) async fn session(
         _ = shutdown.changed() => return Ok(()),
     }
 
-    tracing::info!("registered with Core deployment v2");
+    tracing::info!("registered with Core deployment service");
     status.connected = true;
     record_activity(&deployment.directory, status).await?;
 
@@ -382,14 +382,13 @@ fn execute(
         .targets
         .iter()
         .filter(|(id, target)| selector.matches_target(id, target));
-    let execute = |message| {
-        execute_ordered(
+    let execute = |message, target| {
+        daemon::execute(
             message,
             &context.config,
-            &context.targets,
+            target,
             &context.directory,
             &context.certificate_root,
-            true,
         )
     };
     match operation {
@@ -413,11 +412,14 @@ fn execute(
                 ErrorCode::TargetUnavailable,
                 "no local site matches the selected web server",
             );
-            for (target, _) in targets {
-                result = execute(ServerMessage::Test {
-                    request_id: request_id.into(),
-                    target: target.clone(),
-                });
+            for (id, target) in targets {
+                result = execute(
+                    DeploymentCommand::Test {
+                        request_id: request_id.into(),
+                        target: id.clone(),
+                    },
+                    Some(target),
+                );
                 if result.status == ResultStatus::Failed {
                     break;
                 }
@@ -431,10 +433,26 @@ fn execute(
                     "Core deployment generation is required",
                 );
             };
-            let target = if selector.deployment_type == SAVE_FILES {
+            let (target_id, target) = if selector.deployment_type == SAVE_FILES {
                 let domain = request.domain.trim_end_matches('.').to_ascii_lowercase();
                 let digest = Sha256::digest(domain.as_bytes());
-                format!("v2-{}", hex::encode(&digest[..20]))
+                let id = hex::encode(&digest[..20]);
+                // Keep serving the stable certificate paths created by earlier clients.
+                let existing_id = format!("v2-{id}");
+                let existing = context
+                    .certificate_root
+                    .join("downloads")
+                    .join(&existing_id);
+                match existing.try_exists() {
+                    Ok(true) => (existing_id, None),
+                    Ok(false) => (id, None),
+                    Err(_) => {
+                        return fail(
+                            ErrorCode::LocalPublishFailed,
+                            "cannot inspect the certificate download directory",
+                        );
+                    }
+                }
             } else {
                 let mut matches = targets.filter(|(_, target)| {
                     target
@@ -442,7 +460,7 @@ fn execute(
                         .iter()
                         .any(|domain| domain_matches(domain, &request.domain))
                 });
-                let Some((target, _)) = matches.next() else {
+                let Some((id, target)) = matches.next() else {
                     return fail(
                         ErrorCode::TargetUnavailable,
                         "no local site matches the certificate domain",
@@ -454,12 +472,12 @@ fn execute(
                         "multiple local sites match the certificate domain",
                     );
                 }
-                target.clone()
+                (id.clone(), Some(target))
             };
-            let message = ServerMessage::Deploy {
+            let message = DeploymentCommand::Deploy {
                 request_id: request_id.into(),
                 operation_id: format!("task-{generation}"),
-                target,
+                target: target_id,
                 generation,
                 domain: request.domain.clone(),
                 fullchain_pem: request.cert.clone(),
@@ -473,21 +491,7 @@ fn execute(
                     "invalid certificate deployment request",
                 );
             }
-            if selector.deployment_type == SAVE_FILES {
-                let mut result = execute_ordered(
-                    message,
-                    &context.config,
-                    &BTreeMap::new(),
-                    &context.directory,
-                    &context.certificate_root,
-                    true,
-                );
-                if result.status == ResultStatus::Success {
-                    result.message = "certificate saved to the download directory".into();
-                }
-                return result;
-            }
-            execute(message)
+            execute(message, target)
         }
     }
 }

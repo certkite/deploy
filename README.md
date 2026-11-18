@@ -25,7 +25,7 @@ when distributing to Ubuntu 22.04-class hosts.
 | --- | --- |
 | `certkite-cli` | clap commands, output, exit codes, systemd integration |
 | `certkite-client` | configuration, identity, connection, scheduling and updates |
-| `certkite-protocol` | public JSON protocol, limits and result codes |
+| `certkite-protocol` | local deployment commands, validation limits and result codes |
 | `certkite-deploy` | certificate validation, durable publication and recovery |
 
 ## Configure
@@ -55,15 +55,10 @@ the running user. The optional `downloadGroup` field accepts a numeric local gro
 ID and authorizes that group to read download-only certificates and private keys.
 Unknown fields, including manual `targets`, are rejected. The endpoint has no runtime override.
 
-With Core v2, the client selects a discovered Nginx or Caddy virtual host by
+The client selects a discovered Nginx or Caddy virtual host by
 certificate domain and deploys only when exactly one site matches. The certificate
 must cover all domains on that site. Core's file-only target saves certificates under
 the managed `downloads` directory by domain and applies the configured `downloadGroup`.
-
-With `/client/v1/connect`, the client reports each target's ID, kind and domains
-without exposing local paths. Core binds the certificate to an exact target ID.
-If that target is absent, the client validates and saves the certificate and
-reports that deployment was skipped.
 
 ## Install and operate
 
@@ -118,8 +113,7 @@ First startup generates a persistent random client ID. The daemon registers with
 Core when it connects and refreshes that registration on each reconnect. There
 is no enroll/unenroll command. `certkite status` reports the connection as active
 after Core acknowledges registration. `certkite doctor` verifies the access key
-using the certificate-list OpenAPI with Bearer authentication. If that route
-returns HTTP 404 or 405, it uses the `/client/v1/identity` endpoint.
+using the certificate-list OpenAPI with Bearer authentication.
 
 ```text
 certkite status [--json]
@@ -179,9 +173,8 @@ block certificate publication. Shutdown allows up to five seconds to finish uplo
 Local rotation and Core retention are independent; Core uses its configured log store.
 
 Remote viewing uses Core's existing `/api/logs` endpoint and deployment log store.
-The log endpoint is independent of the `/client/v1/connect` adapter; Core must have
-an active registration for the same client ID before it accepts uploads. Remote
-logs are tied to that registration. The log viewer shows records with verified
+Core accepts uploads from client IDs with an active registration and ties the
+logs to that registration. The log viewer shows records with verified
 registration ownership. Older records without that ownership remain in storage
 for their configured retention period.
 
@@ -205,12 +198,12 @@ The client validates SAN coverage (including IPs and single-label wildcards),
 certificate validity, key matching and supplied chain structure. The supplied last
 issuer is a deployment trust anchor; public PKI trust and revocation are not checked.
 Certificates are stored under `/var/lib/certkite-certificates/<target-id>` in
-immutable version directories before an atomic `current` switch. Certificates
-downloaded for unavailable targets are stored separately under
-`/var/lib/certkite-certificates/downloads/<target-id>`. Services use the stable paths
-`current/fullchain.pem` and `current/privkey.pem`. Downloads have their own operation
-receipts and generation checks, and do not read or modify service deployment journals,
-configuration backups or service directory permissions.
+immutable version directories before an atomic `current` switch. File-only
+deployments use `/var/lib/certkite-certificates/downloads/<target-id>`. Services
+use the stable paths `current/fullchain.pem` and `current/privkey.pem`. Downloads
+have their own operation receipts and generation checks, and do not read or
+modify service deployment journals, configuration backups or service directory
+permissions.
 
 Download-only targets default to root-only access (0700 directories, 0600 files).
 To let other service accounts read them, create a dedicated group and add only the
@@ -280,16 +273,15 @@ release publishing, inspection and interrupted-update recovery.
 
 ## Core integration
 
-Core v2 registration, heartbeats, and certificate deployments use
+Core registration, heartbeats, and certificate deployments use
 `wss://certkite.com/deploy/v2/ws` with the client ID in the query string and the
 access key in the TLS handshake's `Authorization: Bearer` header. Deploy the Core
-backend with Bearer handshake support and v2 task generations before rolling
+backend with Bearer handshake support and task generations before rolling
 out the client. Reverse proxies must forward the `Authorization` header.
 
-If the v2 handshake returns HTTP 404 or 401, the client tries the
-`/client/v1/connect` endpoint with Bearer authentication. Both protocols reject
-older deployments within their own generation sequence. Signed updates use
-the `/client/v1/releases/` endpoints.
+After a connection failure the daemon retries the deployment endpoint with backoff.
+The client rejects older deployment generations for each target. Signed updates
+use the `/client/v1/releases/` endpoints.
 
 The workspace test suite runs against local mock services and needs no private
 repository, production accessKey or real certificate issuance.
