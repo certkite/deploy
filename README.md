@@ -114,8 +114,9 @@ different installed version.
 
 First startup generates a persistent random client ID. Connecting with accessKey
 registers or refreshes that server in Core. There is no enroll/unenroll command.
-The accessKey is sent only as a sensitive Authorization header over verified TLS;
-credentials and private keys are excluded from protocol Debug output.
+The deployment connection sends the access key in a sensitive `Authorization`
+header over verified TLS. Credentials and private keys are excluded from protocol
+Debug output.
 
 ```text
 certkite status [--json]
@@ -158,16 +159,14 @@ Supported severity filters are `error`, `warn`, `info` and `debug`; trace events
 are represented as DEBUG. The global `--log-level` controls collection, so debug
 records require starting the service with `--log-level debug`.
 
-The daemon independently uploads logs to `POST https://certkite.com/client/v1/logs`
-over verified TLS using its access key in the Authorization header. Core stores
-these records in its existing deployment log store. In Core Web, open
-**Deployment → client → Client logs** for history, severity/time/search filters and
-live updates. The first accepted log registers an offline client identity if
-needed; deployment connections maintain online status. Log and deployment registration
-share the same ownership check. Log reads and writes reject client IDs shared by
-different accounts, including historical records. A deleted identity requires
-registration through a deployment connection before logs are accepted again; a
-previous deleted record does not block the same account’s current active identity. Certificate/private-key material and
+The daemon independently uploads logs to `POST https://certkite.com/api/logs`
+over verified TLS using its access key in the `X-Access-Key` header. Requests contain
+`type: "deploy"`, `clientId`, a Unix millisecond `timestamp`, `level` and `message`.
+Core accepts logs for an existing active deployment client owned by the access key's
+account; deployment connections register the client and maintain online status.
+Uploads before registration or after deletion receive HTTP 403 and remain local.
+In Core Web, open **Deployment → client → Client logs** for history,
+severity/time/search filters and live updates. Certificate/private-key material and
 the configured access key are redacted locally, with additional sanitization in Core.
 
 Delivery uses a 256-record memory queue and up to three attempts for transient
@@ -176,8 +175,12 @@ replayed automatically after a restart or reconnect. A slow log server cannot
 block certificate publication. Shutdown allows up to five seconds to finish uploads.
 Local rotation and Core retention are independent; Core uses its configured log store.
 
-Deploy the matching Core backend and proxy `/client/v1/logs` to it before enabling
-remote viewing. The log endpoint is independent of the `/client/v1/connect` adapter.
+Remote viewing uses Core's existing `/api/logs` endpoint and deployment log store.
+The log endpoint is independent of the `/client/v1/connect` adapter; Core must have
+an active registration for the same client ID before it accepts uploads. Remote
+logs are tied to that registration. The log viewer shows records with verified
+registration ownership. Older records without that ownership remain in storage
+for their configured retention period.
 
 Status includes timestamped snapshots, not a claim of current platform connectivity.
 Doctor checks configuration, automatic service discovery, target storage, the

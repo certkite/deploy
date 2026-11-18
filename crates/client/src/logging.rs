@@ -246,7 +246,7 @@ pub async fn report(
         access_key,
         shutdown,
         client,
-        "https://certkite.com/client/v1/logs",
+        "https://certkite.com/api/logs",
     )
     .await;
 }
@@ -259,17 +259,25 @@ async fn report_to(
     client: reqwest::Client,
     endpoint: &str,
 ) {
+    let mut credential = match reqwest::header::HeaderValue::from_str(&access_key) {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("invalid Core log credential; logs remain local");
+            return;
+        }
+    };
+    credential.set_sensitive(true);
     loop {
         let entry = tokio::select! {
             entry = receiver.recv() => match entry { Some(entry) => entry, None => break },
             _ = &mut shutdown, if !receiver.is_closed() => { receiver.close(); continue; },
         };
-        let body = serde_json::json!({"clientId": client_id, "timestamp": entry.timestamp, "level": entry.level, "message": entry.message, "version": crate::config::VERSION});
+        let body = serde_json::json!({"type": "deploy", "clientId": client_id, "timestamp": entry.timestamp, "level": entry.level, "message": entry.message});
         let mut delivered = false;
         for attempt in 0..3 {
             let response = client
                 .post(endpoint)
-                .bearer_auth(&access_key)
+                .header("X-Access-Key", credential.clone())
                 .json(&body)
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
@@ -420,12 +428,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reporter_retries_and_drains_queued_records_with_header_authentication() {
+    async fn reporter_uses_existing_log_contract_retries_transient_errors_and_skips_forbidden() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}/client/v1/logs", listener.local_addr().unwrap());
+        let endpoint = format!("http://{}/api/logs", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            for status in [503, 204, 204] {
+            for (status, message) in [
+                (503, "first"),
+                (200, "first"),
+                (403, "unregistered"),
+                (200, "last"),
+            ] {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut reader = tokio::io::BufReader::new(socket);
                 let mut headers = String::new();
@@ -437,12 +450,13 @@ mod tests {
                     }
                     headers.push_str(&line);
                 }
-                assert!(headers.starts_with("POST /client/v1/logs HTTP/1.1"));
-                assert!(
-                    headers
-                        .to_ascii_lowercase()
-                        .contains("authorization: bearer test-key")
-                );
+                assert!(headers.starts_with("POST /api/logs HTTP/1.1"));
+                let headers_lower = headers.to_ascii_lowercase();
+                let credential = headers_lower
+                    .lines()
+                    .find_map(|line| line.strip_prefix("x-access-key: ").map(str::trim));
+                assert_eq!(credential, Some("test-key"));
+                assert!(!headers_lower.contains("authorization:"));
                 let length: usize = headers
                     .lines()
                     .find_map(|line| {
@@ -454,21 +468,28 @@ mod tests {
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).await.unwrap();
                 let entry: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(entry["clientId"], "test-client");
-                assert_eq!(entry["message"], "connected");
-                assert!(entry.get("version").is_some());
+                assert_eq!(
+                    entry,
+                    serde_json::json!({
+                        "type": "deploy",
+                        "clientId": "test-client",
+                        "timestamp": 1,
+                        "level": "INFO",
+                        "message": message,
+                    })
+                );
                 assert!(!String::from_utf8(body).unwrap().contains("test-key"));
                 reader.get_mut().write_all(format!("HTTP/1.1 {status} Result\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
             }
         });
-        let (sender, receiver) = mpsc::channel(2);
-        for _ in 0..2 {
+        let (sender, receiver) = mpsc::channel(3);
+        for message in ["first", "unregistered", "last"] {
             sender
                 .send(LogEntry {
                     id: uuid::Uuid::new_v4().to_string(),
                     timestamp: 1,
                     level: "INFO".into(),
-                    message: "connected".into(),
+                    message: message.into(),
                 })
                 .await
                 .unwrap();
