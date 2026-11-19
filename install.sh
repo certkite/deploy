@@ -20,7 +20,7 @@ esac
 [ "${#RELEASE_PUBLIC_KEY_HEX}" -eq 64 ] || die "release verification key is not configured"
 case "$RELEASE_PUBLIC_KEY_HEX" in *[!0-9A-Fa-f]*) die "invalid release verification key" ;; esac
 [ -n "${HOME:-}" ] || die "HOME is not set"
-for command in curl sha256sum mktemp install stat mv chmod python3 openssl id; do
+for command in curl sha256sum mktemp install stat chmod python3 openssl id; do
     command -v "$command" >/dev/null 2>&1 || die "$command is required"
 done
 
@@ -168,16 +168,68 @@ owner=$(stat -c %u "$install_dir")
 mode=$(stat -c %a "$install_dir")
 [ "$owner" -eq "$(id -u)" ] && [ $((0$mode & 022)) -eq 0 ] \
     || die "$install_dir must belong to the current user and not be group/world-writable"
-if [ -e "$destination" ] || [ -L "$destination" ]; then
-    [ -f "$destination" ] && [ ! -L "$destination" ] || die "$destination must be a regular file"
-    owner=$(stat -c %u "$destination")
-    mode=$(stat -c %a "$destination")
-    [ "$owner" -eq "$(id -u)" ] && [ $((0$mode & 022)) -eq 0 ] \
-        || die "$destination has unsafe ownership or permissions"
-fi
 stage=$(mktemp "$install_dir/.certkite-install.XXXXXX")
 install -m 0755 "$binary" "$stage"
-mv -f -- "$stage" "$destination"
+python3 - "$stage" "$destination" "$version" <<'PY'
+import fcntl
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+
+stage, destination = map(pathlib.Path, sys.argv[1:3])
+version = sys.argv[3]
+uid = os.geteuid()
+lock = destination.parent / ".certkite-update.lock"
+try:
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1 or info.st_mode & 0o077:
+        raise ValueError("unsafe update lock")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise ValueError("another CertKite installation or update is active") from None
+
+    try:
+        info = destination.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
+            raise ValueError(f"{destination} has unsafe type, ownership or permissions")
+        output = subprocess.run(
+            [destination, "--version"], capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+        current = re.fullmatch(
+            r"certkite ((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))"
+            r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+            output,
+        )
+        if current is None:
+            raise ValueError(f"cannot determine the installed CertKite version at {destination}")
+        # The candidate is a stable release. It outranks prereleases with the same core version.
+        if tuple(map(int, current[1].split("."))) > tuple(map(int, version.split("+", 1)[0].split("."))):
+            raise ValueError(f"refusing to downgrade {output} to {version}")
+
+    with stage.open("rb") as candidate:
+        os.fsync(candidate.fileno())
+    if info is None:
+        # A separately verified local installer can also create the initial binary.
+        os.link(stage, destination)
+        stage.unlink()
+    else:
+        os.replace(stage, destination)
+    directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+except (OSError, ValueError, subprocess.SubprocessError) as error:
+    raise SystemExit(f"certkite installer: {error}")
+PY
 stage=
 
 echo "CertKite CLI installed at $destination"

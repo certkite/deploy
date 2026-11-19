@@ -1,8 +1,8 @@
 //! Command-line entry point; all public commands are declared with clap.
 mod logs;
-mod service;
 
 use anyhow::{Context, Result, bail};
+use certkite_client::config;
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
@@ -19,8 +19,8 @@ use std::{
     about = "Install and manage CertKite certificates on this server"
 )]
 struct Cli {
-    #[arg(long, global = true, default_value = certkite_client::config::CONFIG_PATH)]
-    config: PathBuf,
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
     #[arg(long, global = true, default_value = "info", value_parser = ["error", "warn", "info", "debug", "trace"])]
     log_level: String,
     #[command(subcommand)]
@@ -29,8 +29,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(name = "__daemon", hide = true)]
-    Daemon,
+    /// Run the certificate client in the foreground.
+    #[command(alias = "__daemon")]
+    Run,
     /// Show local identity, service properties, and timestamped runtime state.
     Status(OutputArgs),
     /// Show local daemon logs, optionally following new records.
@@ -39,11 +40,6 @@ enum Commands {
     Doctor(OutputArgs),
     /// Check or install a signed release from CertKite.
     Update(UpdateArgs),
-    /// Install or remove the systemd service, retaining certificates and identity.
-    Service {
-        #[command(subcommand)]
-        command: ServiceCommand,
-    },
     #[command(name = "__update-worker", hide = true)]
     UpdateWorker {
         #[arg(long)]
@@ -67,12 +63,42 @@ struct UpdateArgs {
     json: bool,
 }
 
-#[derive(Subcommand)]
-enum ServiceCommand {
-    /// Install the service, enable boot startup, and start it now.
-    Install,
-    /// Stop and remove the service; keep credentials, certificates, and binary.
-    Uninstall,
+impl Cli {
+    fn config_path(&self) -> Result<PathBuf> {
+        self.config.clone().map_or_else(config::default_config, Ok)
+    }
+}
+
+async fn service_state() -> Result<serde_json::Value> {
+    anyhow::ensure!(cfg!(target_os = "linux"), "systemd requires Linux");
+    let mut command = tokio::process::Command::new("/usr/bin/systemctl");
+    if !config::is_system_installation() {
+        command.arg("--user");
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        command
+            .args([
+                "show",
+                "certkite.service",
+                "--property=LoadState,ActiveState,SubState,MainPID,UnitFileState,Type,Result",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("systemd status timed out")??;
+    anyhow::ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), json!(value)))
+        .collect::<serde_json::Map<_, _>>()
+        .into())
 }
 
 fn json_requested(command: &Commands) -> bool {
@@ -116,19 +142,16 @@ async fn execute(
     cli: Cli,
     log_receiver: Option<tokio::sync::mpsc::Receiver<certkite_client::logging::LogEntry>>,
 ) -> Result<u8> {
-    match cli.command {
-        Commands::Daemon => {
-            certkite_client::daemon::run_with_logs(&cli.config, log_receiver).await?;
+    match &cli.command {
+        Commands::Run => {
+            certkite_client::daemon::run_with_logs(&cli.config_path()?, log_receiver).await?;
         }
         Commands::Logs(args) => logs::show(args).await?,
         Commands::Status(args) => {
             let snapshot = certkite_client::status()?;
-            let service = if cfg!(target_os = "linux") {
-                service::state()
-                    .unwrap_or_else(|error| json!({"available":false,"error":error.to_string()}))
-            } else {
-                json!({"available":false,"reason":"systemd requires Linux"})
-            };
+            let service = service_state()
+                .await
+                .unwrap_or_else(|error| json!({"available":false,"error":error.to_string()}));
             if args.json {
                 output(&json!({"client":snapshot,"systemd":service}))?;
             } else {
@@ -150,13 +173,13 @@ async fn execute(
                         println!("Last operation: {} — {}", result.target, result.message);
                     }
                 } else {
-                    println!("No runtime snapshot. Start the service to initialize this server.");
+                    println!("No runtime snapshot. Start the client with `certkite run`.");
                 }
                 println!("Systemd: {service}");
             }
         }
         Commands::Doctor(args) => {
-            let report = certkite_client::doctor(&cli.config).await?;
+            let report = certkite_client::doctor(&cli.config_path()?).await?;
             if args.json {
                 output(&report)?;
             } else {
@@ -183,15 +206,16 @@ async fn execute(
                         check.current_version, check.manifest.version, check.available
                     );
                 }
-            } else {
-                let job = certkite_client::update::launch(args.to.as_deref(), &cli.config).await?;
+            } else if config::is_system_installation() {
+                let job = certkite_client::update::launch(args.to.as_deref(), &cli.config_path()?)
+                    .await?;
                 if !args.json {
                     eprintln!(
                         "Update {} is running in an independent systemd unit.",
                         job.id
                     );
                 }
-                let pending = Path::new(certkite_client::config::STATE_DIR).join("update-pending");
+                let pending = Path::new(config::SYSTEM_STATE).join("update-pending");
                 let result = wait_for_update(&job.path, &pending).await?;
                 let succeeded = result.status == "succeeded";
                 if args.json {
@@ -205,19 +229,22 @@ async fn execute(
                 if !succeeded {
                     return Ok(1);
                 }
+            } else {
+                let result = certkite_client::update::install_user(args.to.as_deref()).await?;
+                if args.json {
+                    output(&result)?;
+                } else if result.available {
+                    println!(
+                        "Installed certkite {}. Restart the running client to use it.",
+                        result.manifest.version
+                    );
+                } else {
+                    println!("CertKite {} is already installed.", result.current_version);
+                }
             }
         }
-        Commands::Service { command } => match command {
-            ServiceCommand::Install => {
-                service::install(&cli.config)?;
-                println!("certkite.service installed and started.");
-            }
-            ServiceCommand::Uninstall => {
-                service::uninstall()?;
-                println!("Service removed. Configuration, identity and certificates are retained.");
-            }
-        },
         Commands::UpdateWorker { job } => {
+            let job = job.clone();
             tokio::task::spawn_blocking(move || certkite_client::update::worker(&job))
                 .await
                 .context("update worker terminated")??;
@@ -230,42 +257,16 @@ async fn execute(
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = json_requested(&cli.command);
-    let daemon = matches!(&cli.command, Commands::Daemon);
+    let daemon = matches!(&cli.command, Commands::Run);
     // Dependency trace output may contain complete WebSocket certificate messages.
     let filter = format!(
         "warn,certkite_client={},certkite_deploy={},certkite_protocol={}",
         cli.log_level, cli.log_level, cli.log_level
     );
-    if matches!(
-        &cli.command,
-        Commands::Service {
-            command: ServiceCommand::Install
-        }
-    ) && cli.config == Path::new(certkite_client::config::CONFIG_PATH)
-    {
-        match service::create_default_config(&cli.config) {
-            Ok(true) => {
-                println!(
-                    "Created {}. Fill in accessKey, then run `certkite service install` again. Nginx and Caddy sites will be detected automatically.",
-                    cli.config.display()
-                );
-                return ExitCode::SUCCESS;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                eprintln!("{error:#}");
-                return ExitCode::from(1);
-            }
-        }
-    }
-    if matches!(
-        &cli.command,
-        Commands::Daemon
-            | Commands::Doctor(_)
-            | Commands::Service {
-                command: ServiceCommand::Install
-            }
-    ) && let Err(error) = certkite_client::config::Config::load(&cli.config)
+    if matches!(&cli.command, Commands::Run | Commands::Doctor(_))
+        && let Err(error) = cli
+            .config_path()
+            .and_then(|path| config::Config::load(&path))
     {
         if json {
             if let Err(write_error) = output(
@@ -281,9 +282,9 @@ async fn main() -> ExitCode {
     let log_receiver = if daemon && cfg!(target_os = "linux") {
         use tracing_subscriber::prelude::*;
         let setup = (|| -> Result<_> {
-            let config = certkite_client::config::Config::load(&cli.config)?;
+            let config = config::Config::load(&cli.config_path()?)?;
             let (layer, receiver) = certkite_client::logging::LogLayer::new(
-                Path::new(certkite_client::config::STATE_DIR),
+                &config::state_directory()?,
                 config.access_key(),
             )?;
             tracing_subscriber::registry()
@@ -340,6 +341,7 @@ mod tests {
     #[test]
     fn clap_accepts_supported_operations_and_worker_handoff() {
         for args in [
+            vec!["certkite", "run"],
             vec!["certkite", "__daemon"],
             vec!["certkite", "status", "--json"],
             vec![
@@ -347,8 +349,6 @@ mod tests {
             ],
             vec!["certkite", "doctor"],
             vec!["certkite", "update", "--check", "--to", "1.2.3"],
-            vec!["certkite", "service", "install"],
-            vec!["certkite", "service", "uninstall"],
             vec![
                 "certkite",
                 "--config",
@@ -393,7 +393,8 @@ mod tests {
 
     #[test]
     fn removed_and_incomplete_commands_are_usage_errors() {
-        assert!(Cli::try_parse_from(["certkite", "run"]).is_err());
+        assert!(Cli::try_parse_from(["certkite", "service", "install"]).is_err());
+        assert!(Cli::try_parse_from(["certkite", "service", "uninstall"]).is_err());
         assert!(Cli::try_parse_from(["certkite", "--log-level", "invalid", "__daemon"]).is_err());
         assert!(Cli::try_parse_from(["certkite", "service"]).is_err());
         assert!(Cli::try_parse_from(["certkite", "logs", "--lines", "0"]).is_err());

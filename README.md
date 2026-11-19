@@ -1,13 +1,13 @@
 # CertKite Client
 
-A Rust CLI and systemd service for installing certificates managed by CertKite.
+A Rust CLI that downloads and renews certificates managed by CertKite.
 The client connects to `https://certkite.com` using an `accessKey`; it does not
 need an inbound port or SSH credentials. Core remains a separate, closed-source
 service. This workspace contains no Core source or private dependencies.
 
-Linux amd64/arm64 with systemd is the supported runtime. Active Nginx and Caddy
-virtual hosts are detected and configured automatically. macOS can build and run
-isolated tests; it cannot run the Linux service or self-updater.
+The client runs on Linux amd64/arm64 from a regular user account. It can run in
+the foreground or under a user-level systemd service. macOS can build and run
+isolated tests.
 
 ## Build
 
@@ -23,42 +23,10 @@ when distributing to Ubuntu 22.04-class hosts.
 
 | Crate | Responsibility |
 | --- | --- |
-| `certkite-cli` | clap commands, output, exit codes, systemd integration |
+| `certkite-cli` | clap commands, output, exit codes, systemd status |
 | `certkite-client` | configuration, identity, connection, scheduling and updates |
 | `certkite-protocol` | local deployment commands, validation limits and result codes |
 | `certkite-deploy` | certificate validation, durable publication and recovery |
-
-## Configure
-
-The first `sudo certkite service install` creates
-`/etc/certkite-client/config.toml` with mode 0600 when the default configuration
-is missing, then exits without installing or starting the service. Fill in only
-the access key and run the command again:
-
-```sh
-sudo install -d -m 0700 /etc/certkite-client
-sudo install -m 0600 packaging/config.example.toml /etc/certkite-client/config.toml
-sudoedit /etc/certkite-client/config.toml
-```
-
-```toml
-accessKey = "replace-with-your-certkite-access-key"
-```
-
-Service installation detects active Nginx and Caddy virtual hosts using the
-standard service binary and configuration locations. It validates detected
-service configurations, discovers each site's domains, creates a stable
-local target ID, and grants the client write access only to the discovered config
-directories and managed certificate root. Servers without detected virtual hosts
-can install and run the client to download certificates. Configuration is mode 0600 and owned by
-the running user. The optional `downloadGroup` field accepts a numeric local group
-ID and authorizes that group to read download-only certificates and private keys.
-Unknown fields, including manual `targets`, are rejected. The endpoint has no runtime override.
-
-The client selects a discovered Nginx or Caddy virtual host by
-certificate domain and deploys only when exactly one site matches. The certificate
-must cover all domains on that site. Core's file-only target saves certificates under
-the managed `downloads` directory by domain and applies the configured `downloadGroup`.
 
 ## Install and operate
 
@@ -73,8 +41,7 @@ sh install.sh
 curl -fsSL https://certkite.com/install.sh | sh
 ```
 
-The installer does not request sudo, create configuration or start services.
-If `~/.local/bin` is outside PATH, add it to your shell configuration:
+Add `~/.local/bin` to your shell configuration if it is outside PATH:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -84,30 +51,73 @@ certkite update --check
 
 Release builds produce an installer with the trusted public key embedded. The
 source installer rejects installation until `RELEASE_PUBLIC_KEY_HEX` is configured.
-Rerun the trusted installer to replace a user-installed CLI. System certificate
-management still requires a separately installed root service; the signed
-`certkite update` command updates that service's `/usr/local/bin/certkite` binary.
-
-To install a verified release binary as the system service:
+You can also install a locally obtained binary using a SHA-256 digest you verified
+independently:
 
 ```sh
-sudo install -m 0755 ./certkite /usr/local/bin/certkite
-sudo /usr/local/bin/certkite service install
+sh packaging/install.sh --binary PATH --sha256 DIGEST
 ```
 
-If this creates the default configuration, edit the access key before validating
-and completing installation:
+### Configure and run
+
+Create a private configuration owned by the account that runs CertKite:
 
 ```sh
-sudoedit /etc/certkite-client/config.toml
-sudo certkite doctor
-sudo certkite service install
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/certkite"
+install -d -m 0700 "$config_dir"
+if [ ! -e "$config_dir/config.toml" ]; then
+    install -m 0600 packaging/config.example.toml "$config_dir/config.toml"
+fi
+"${EDITOR:-vi}" "$config_dir/config.toml"
+certkite doctor
+certkite run
 ```
 
-Alternatively, `packaging/install.sh --binary PATH --sha256 DIGEST --config PATH`
-installs a locally obtained binary whose digest you independently verified. The
-script does not fetch binaries, accept credentials in arguments or overwrite a
-different installed version.
+Create `config.toml` with `accessKey = "your-certkite-access-key"` if the example
+file is unavailable. Configuration files must use mode 0600 or stricter. `--config PATH` selects a
+specific file. Unknown fields, including manual `targets`, are rejected. The
+endpoint has no runtime override.
+
+CertKite uses absolute XDG base directories when set. Default paths are:
+
+| Data | Default directory | Override |
+| --- | --- | --- |
+| Configuration | `~/.config/certkite` | `XDG_CONFIG_HOME` |
+| Identity, state and logs | `~/.local/state/certkite` | `XDG_STATE_HOME` |
+| Certificates | `~/.local/share/certkite/certificates` | `XDG_DATA_HOME` |
+
+### Run in the background
+
+On hosts with a user systemd manager, save the following as
+`${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/certkite.service`. If you set custom
+XDG directories for CertKite, pass the same values to the user service using
+`Environment=`.
+
+```ini
+[Unit]
+Description=CertKite certificate client
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/certkite run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=300s
+UMask=0077
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now certkite.service
+```
+
+The user manager's lifetime determines whether the service keeps running after
+logout. Check the host's lingering policy if certificates must renew while no one
+is logged in. To stop the service and remove its startup link, use
+`systemctl --user disable --now certkite.service`.
 
 First startup generates a persistent random client ID. The daemon registers with
 Core when it connects and refreshes that registration on each reconnect. There
@@ -116,39 +126,38 @@ after Core acknowledges registration. `certkite doctor` verifies the access key
 using the certificate-list OpenAPI with Bearer authentication.
 
 ```text
+certkite run
 certkite status [--json]
 certkite logs [-n LINES] [-f] [--level LEVEL] [--json]
 certkite doctor [--json]
 certkite update [--check] [--to VERSION] [--json]
-certkite service install
-certkite service uninstall
 ```
 
-Global flags: `--config PATH`, `--log-level LEVEL`, `--help`, `--version`.
-The daemon entry point is private; use systemd for service lifecycle:
+Global flags include `--config PATH`, `--log-level LEVEL`, `--help` and `--version`.
+Run these commands as the same account as the client:
 
 ```sh
-sudo certkite status --json
-sudo systemctl restart certkite
-sudo certkite logs -f
+certkite status --json
+certkite logs -f
+systemctl --user restart certkite.service  # If running under user systemd
 ```
 
 ### Logs
 
 The daemon records startup, Core connection, operation progress, results and failures.
 Logs are sanitized before writing to private JSON Lines files in
-`/var/lib/certkite-client/`: `client.log` and one rotated file, `client.log.1`.
+the user state directory: `client.log` and one rotated file, `client.log.1`.
 Each file is capped at 2 MiB and uses mode 0600. A shared process lock keeps reads
 consistent with appends and rotation. Logging also writes to stderr,
-which systemd captures in its journal. Configuration failures before logging starts
-remain available with `journalctl -u certkite`.
+which systemd captures in its journal when used. For a user service, see
+`journalctl --user -u certkite.service` for failures before the log file opens.
 
 ```sh
-sudo certkite logs                  # Latest 100 records
-sudo certkite logs -n 200           # Latest 200 records (maximum 1000)
-sudo certkite logs -f               # Follow new records; Ctrl+C exits
-sudo certkite logs --level error    # Exact severity filter
-sudo certkite logs --json           # One JSON record per line
+certkite logs                  # Latest 100 records
+certkite logs -n 200           # Latest 200 records (maximum 1000)
+certkite logs -f               # Follow new records; Ctrl+C exits
+certkite logs --level error    # Exact severity filter
+certkite logs --json           # One JSON record per line
 ```
 
 Records include a unique ID, Unix millisecond timestamp, severity and message.
@@ -178,72 +187,34 @@ logs to that registration. The log viewer shows records with verified
 registration ownership. Older records without that ownership remain in storage
 for their configured retention period.
 
-Status includes timestamped snapshots, not a claim of current platform connectivity.
-Doctor checks configuration, automatic service discovery, target storage, the
-Nginx/Caddy configuration and platform identity without publishing certificates
-or reloading services.
-Uninstall removes the service and preserves binary, identity, configuration and
-certificates. Never copy identity.json to another live server.
+Status includes timestamped snapshots. Doctor checks the private configuration and
+platform identity. Never copy `identity.json` to another live client.
 
-Exit codes: 0 success, 1 operation failure, 2 command usage error, 3 configuration
-failure for the daemon, doctor or service installation, and 4 when doctor completes with
-failed checks. Creating the initial configuration template is successful but does not
-install or start the service.
-JSON command results and `certkite logs` output go to stdout; diagnostic output goes
-to stderr.
+Exit codes are 0 for success, 1 for operation failure, 2 for command usage errors,
+3 for invalid configuration, and 4 when doctor completes with failed checks.
+JSON command results and `certkite logs` output go to stdout. Diagnostic output
+uses stderr.
 
 ## Certificate publication
 
-The client validates SAN coverage (including IPs and single-label wildcards),
-certificate validity, key matching and supplied chain structure. The supplied last
-issuer is a deployment trust anchor; public PKI trust and revocation are not checked.
-Certificates are stored under `/var/lib/certkite-certificates/<target-id>` in
-immutable version directories before an atomic `current` switch. File-only
-deployments use `/var/lib/certkite-certificates/downloads/<target-id>`. Services
-use the stable paths `current/fullchain.pem` and `current/privkey.pem`. Downloads
-have their own operation receipts and generation checks, and do not read or
-modify service deployment journals, configuration backups or service directory
-permissions.
+Select the file-only deployment target for this client in Core. The client validates
+SAN coverage (including IPs and single-label wildcards), certificate validity, key
+matching and chain structure. The last supplied issuer is the deployment trust
+anchor. Public PKI trust and revocation are outside this validation.
 
-Download-only targets default to root-only access (0700 directories, 0600 files).
-To let other service accounts read them, create a dedicated group and add only the
-authorized accounts:
+Each target publishes immutable versions under the user data directory, at
+`~/.local/share/certkite/certificates/downloads/<target-id>/` by default. Consumers use the stable
+paths `current/fullchain.pem` and `current/privkey.pem`. Renewals atomically switch
+`current` to the new version. Consumers that cache certificates must reload after
+renewal. For containers, mount the target directory including `versions` and `current`.
 
-```sh
-sudo groupadd --system certkite-tls
-sudo usermod -aG certkite-tls <service-user>
-getent group certkite-tls
-```
-
-Set `downloadGroup = <numeric-GID>` in `/etc/certkite-client/config.toml`, using the
-third field from `getent`, then restart `certkite` and the consuming service so its
-process picks up the group membership. On the next download, all retained versions
-for that target receive 0750 directories and 0640 certificate/key files owned by
-root and the configured group. Renewal preserves that access; removing the setting
-restores root-only access on the next download for each target. The certificate root
-and `downloads` container use 0711 so service users can traverse known paths.
-Journals and lock files remain 0600. Every member of the group can read all
-download-only targets published with that group.
-
-Verify with the actual service account and target ID:
-
-```sh
-sudo -u <service-user> test -r /var/lib/certkite-certificates/downloads/<target-id>/current/fullchain.pem
-sudo -u <service-user> test -r /var/lib/certkite-certificates/downloads/<target-id>/current/privkey.pem
-```
-
-Consuming services must reload certificates after renewal. For containers, mount
-the target directory, including `versions` and `current`, and provide the same
-numeric GID to the container process. Service sandboxing, SELinux and AppArmor must
-also permit access to the mounted path.
-
-For Nginx, the matching `server` block receives or updates `listen 443 ssl`,
-`ssl_certificate` and `ssl_certificate_key`. For Caddy, the matching site block
-receives or updates its `tls` directive. The client validates the complete service
-configuration and reloads its systemd unit. Config edits and certificate publication
-are journaled and rolled back together when validation, reload or recovery fails.
-Ambiguous duplicate sites, imported Caddy site definitions and complex Caddy
-`tls { ... }` blocks are rejected rather than guessed.
+The target's directories and certificate files default to `0700` and `0600`.
+`downloadGroup = <numeric-GID>` grants an existing group read access by setting
+retained target directories to `0750` and certificate/key files to `0640` on the
+next download. The running account must be able to assign that group, and consumers
+must be able to traverse the certificate path. Every member of the group can read
+all private keys shared with that group. Removing `downloadGroup` restores private
+access on the next download for each target.
 
 Task retries reuse an operation ID. Content conflicts and older generations are
 rejected; the last 256 operation receipts are retained per target. Interrupted
@@ -252,24 +223,28 @@ do not cancel an in-flight file publication. After a successful commit, certific
 storage retains the current and immediately previous versions; older versions and
 abandoned version staging directories are pruned. Operation receipts remain valid
 after their certificate files have been pruned.
-Before each update, completed update jobs are pruned to one prior job, so at most
-the new job and one prior job remain after completion.
 
 ## Updates
 
 ```sh
 certkite update --check
-sudo certkite update
-sudo certkite update --to 1.2.3
+certkite update
+certkite update --to 1.2.3
 ```
 
-Updates require a release public key embedded at build time. Builds without
-`CERTKITE_RELEASE_PUBLIC_KEY_HEX` reject updates explicitly. The independent systemd
-worker verifies the signed manifest and artifact, drains operations, stops the old
-service, atomically replaces the binary, and checks Type=notify readiness, actual
-process inode and version. Startup failure attempts verified rollback. Configuration,
-identity and certificates are preserved. See [signed updates](docs/update.md) for
-release publishing, inspection and interrupted-update recovery.
+Updates require `CERTKITE_RELEASE_PUBLIC_KEY_HEX` at build time. The client checks the
+signed release manifest and validates the replacement binary before atomically
+installing it at `~/.local/bin/certkite`. Restart `certkite run` or the user service
+after the update to use the new executable.
+
+## Existing system installations
+
+Existing root-managed services using `/usr/local/bin/certkite` and `__daemon`
+keep their original configuration, identity, certificate paths, automatic system
+Nginx/Caddy deployment and signed system updates. Managing that system service
+and changing or reloading system-owned Nginx/Caddy still requires the host's
+administrator permissions. The user client registers independently and publishes
+renewed certificate files to its own directory.
 
 ## Core integration
 

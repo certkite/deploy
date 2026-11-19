@@ -5,7 +5,9 @@ Unix certificate deployment library with automatic Nginx and Caddy site discover
 and returns one stable target per virtual host. Local paths and service commands
 remain client-controlled.
 
-Certificates are stored under `/var/lib/certkite-certificates/<target-id>`.
+The user client stores file targets under `~/.local/share/certkite/certificates/downloads` by
+default. Existing system installs use `/var/lib/certkite-certificates/<target-id>`
+for Nginx and Caddy targets.
 An immutable `versions/<sha256>` directory is fsynced before an atomic `current`
 symlink switch. Nginx targets use root-only 0700/0600 storage. Caddy targets use
 0750 directories and 0640 certificate files owned by root and the service group,

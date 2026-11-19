@@ -3,20 +3,21 @@
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use std::{
+    env,
     fs::OpenOptions,
     io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::Path,
+    path::{Component, Path, PathBuf},
 };
 
-/// Default configuration file. The service endpoint is intentionally not configurable.
-pub const CONFIG_PATH: &str = "/etc/certkite-client/config.toml";
+/// Configuration for existing system service installations.
+pub const SYSTEM_CONFIG: &str = "/etc/certkite-client/config.toml";
 /// Fixed service origin, also used by release requests.
 pub const SERVER_ORIGIN: &str = "https://certkite.com";
-/// Persistent client data, independent of deployed certificate directories.
-pub const STATE_DIR: &str = "/var/lib/certkite-client";
-/// Ephemeral locks used by the installed service.
-pub const RUN_DIR: &str = "/run/certkite-client";
+/// Persistent data for existing system service installations.
+pub const SYSTEM_STATE: &str = "/var/lib/certkite-client";
+/// Executable used by existing system service installations.
+pub const SYSTEM_BINARY: &str = "/usr/local/bin/certkite";
 /// Running binary version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -35,6 +36,54 @@ pub struct Config {
 pub fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no arguments and has no memory or lifetime requirements.
     unsafe { libc::geteuid() }
+}
+
+/// Whether this command is managing an existing system installation.
+pub fn is_system_installation() -> bool {
+    cfg!(target_os = "linux")
+        && effective_uid() == 0
+        && env::current_exe().is_ok_and(|path| path == Path::new(SYSTEM_BINARY))
+}
+
+fn absolute_env(name: &str) -> Option<PathBuf> {
+    env::var_os(name).map(PathBuf::from).filter(|path| {
+        path.is_absolute() && !path.components().any(|part| part == Component::ParentDir)
+    })
+}
+
+fn home() -> Result<PathBuf> {
+    absolute_env("HOME").context("set HOME to an absolute home directory")
+}
+
+fn user_base(name: &str, default: &str) -> Result<PathBuf> {
+    match absolute_env(name) {
+        Some(path) => Ok(path),
+        None => Ok(home()?.join(default)),
+    }
+}
+
+pub fn state_directory() -> Result<PathBuf> {
+    if is_system_installation() {
+        Ok(PathBuf::from(SYSTEM_STATE))
+    } else {
+        Ok(user_base("XDG_STATE_HOME", ".local/state")?.join("certkite"))
+    }
+}
+
+pub fn default_config() -> Result<PathBuf> {
+    if is_system_installation() {
+        Ok(PathBuf::from(SYSTEM_CONFIG))
+    } else {
+        Ok(user_base("XDG_CONFIG_HOME", ".config")?.join("certkite/config.toml"))
+    }
+}
+
+pub fn user_certificate_root() -> Result<PathBuf> {
+    Ok(user_base("XDG_DATA_HOME", ".local/share")?.join("certkite/certificates"))
+}
+
+pub fn user_binary() -> Result<PathBuf> {
+    Ok(home()?.join(".local/bin/certkite"))
 }
 
 impl Config {

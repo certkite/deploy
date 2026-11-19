@@ -194,6 +194,9 @@ pub(crate) fn configure(target: &TargetConfig) -> Result<bool> {
 }
 
 pub(crate) fn restore_config(target: &TargetConfig) -> Result<()> {
+    if target.config_file().is_none() {
+        return Ok(());
+    }
     let path = backup_path(target);
     let Some(metadata) = paths::read(&path)? else {
         return Ok(());
@@ -210,6 +213,9 @@ pub(crate) fn restore_config(target: &TargetConfig) -> Result<()> {
 }
 
 pub(crate) fn discard_config_backup(target: &TargetConfig) -> Result<()> {
+    if target.config_file().is_none() {
+        return Ok(());
+    }
     match fs::remove_file(backup_path(target)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

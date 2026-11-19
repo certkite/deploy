@@ -87,6 +87,11 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
 /// Hold an advisory exclusive lock. The lock is released when the file closes.
 pub fn lock(path: &Path, nonblocking: bool) -> Result<File> {
     private_dir(path.parent().context("lock has no parent")?)?;
+    lock_file(path, nonblocking)
+}
+
+/// Lock a file after its parent directory has been validated by the caller.
+pub(crate) fn lock_file(path: &Path, nonblocking: bool) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -99,6 +104,7 @@ pub fn lock(path: &Path, nonblocking: bool) -> Result<File> {
     ensure!(
         meta.is_file()
             && meta.uid() == crate::config::effective_uid()
+            && meta.nlink() == 1
             && meta.permissions().mode() & 0o077 == 0,
         "unsafe lock file"
     );

@@ -134,9 +134,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "certkite-client",
- "certkite-deploy",
  "clap",
- "fs2",
  "serde",
  "serde_json",
  "tempfile",

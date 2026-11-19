@@ -1,10 +1,10 @@
 use anyhow::Result;
 use certkite_client::{
-    config::STATE_DIR,
+    config,
     logging::{self, LogEntry},
 };
 use clap::Args;
-use std::{io::Write, path::Path, time::Duration};
+use std::{io::Write, time::Duration};
 
 #[derive(Args)]
 pub struct LogArgs {
@@ -40,9 +40,10 @@ fn print(entries: &[LogEntry], json: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn show(args: LogArgs) -> Result<()> {
-    let level = args.level.map(|level| level.to_ascii_uppercase());
-    let entries = logging::read(Path::new(STATE_DIR), args.lines as usize, level.as_deref())?;
+pub async fn show(args: &LogArgs) -> Result<()> {
+    let level = args.level.as_deref().map(str::to_ascii_uppercase);
+    let directory = config::state_directory()?;
+    let entries = logging::read(&directory, args.lines as usize, level.as_deref())?;
     print(&entries, args.json)?;
     if !args.follow {
         return Ok(());
@@ -54,8 +55,9 @@ pub async fn show(args: LogArgs) -> Result<()> {
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}
         }
         let level = level.clone();
+        let directory = directory.clone();
         let entries = tokio::task::spawn_blocking(move || {
-            logging::read(Path::new(STATE_DIR), logging::MAX_LINES, level.as_deref())
+            logging::read(&directory, logging::MAX_LINES, level.as_deref())
         })
         .await??;
         let start = last_id

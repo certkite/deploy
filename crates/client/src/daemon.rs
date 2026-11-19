@@ -1,7 +1,7 @@
 //! Foreground daemon with independent network and blocking deployment tasks.
 
 use crate::{
-    config::{Config, STATE_DIR, VERSION},
+    config::{self, Config, VERSION},
     core::{self, DeploymentContext},
     identity::Identity,
     state::{self, RuntimeStatus},
@@ -12,6 +12,8 @@ use certkite_deploy::TargetConfig;
 use certkite_protocol::{DeploymentCommand, ErrorCode, OperationResult, ResultStatus};
 use std::{
     collections::BTreeMap,
+    fs,
+    os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -40,26 +42,52 @@ pub async fn run_with_logs(
         cfg!(target_os = "linux"),
         "the daemon requires Linux; use doctor for local diagnostics"
     );
-    ensure!(
-        crate::config::effective_uid() == 0,
-        "the installed daemon must run as root"
-    );
+    let system = config::is_system_installation();
+    let directory = config::state_directory()?;
+    let certificate_root = if system {
+        PathBuf::from(certkite_deploy::CERTIFICATE_ROOT)
+    } else {
+        config::user_certificate_root()?
+    };
     let config = Arc::new(Config::load(config_path)?);
-    let discovered = tokio::task::spawn_blocking(certkite_deploy::discover).await??;
+    state::private_dir(&directory)?;
+    let _singleton = state::lock(&directory.join("runtime.lock"), true)
+        .context("another client is already running")?;
+    let now = state::now()?;
+    let mut status = RuntimeStatus {
+        pid: std::process::id(),
+        version: VERSION.into(),
+        build_id: build_id().into(),
+        started_at: now,
+        updated_at: now,
+        ..Default::default()
+    };
+    save_status(&directory, &status).await?;
+    let discovered = if system {
+        crate::update::recover_pending()?;
+        tokio::task::spawn_blocking(certkite_deploy::discover).await??
+    } else {
+        let root = certificate_root.clone();
+        tokio::task::spawn_blocking(move || {
+            fs::DirBuilder::new().recursive(true).mode(0o755).create(
+                root.parent()
+                    .context("missing certificate directory parent")?,
+            )?;
+            certkite_deploy::prepare_certificate_root(&root)
+        })
+        .await??;
+        Vec::new()
+    };
     let targets = Arc::new(
         discovered
             .into_iter()
             .map(|target| (target.id, target.config))
             .collect::<BTreeMap<_, _>>(),
     );
-    let directory = PathBuf::from(STATE_DIR);
-    state::private_dir(&directory)?;
-    let _singleton = state::lock(&directory.join("runtime.lock"), true)
-        .context("another client is already running")?;
-    crate::update::recover_pending()?;
     let identity = Identity::load_or_create(&directory)?;
     let client_id = identity.client_id.to_string();
     let recovery_targets = targets.clone();
+    let downloads = certificate_root.join("downloads");
     tokio::task::spawn_blocking(move || -> Result<()> {
         // The singleton protects startup recovery. An updater may hold deployment.lock
         // while waiting for this new process to become ready.
@@ -67,18 +95,11 @@ pub async fn run_with_logs(
             certkite_deploy::recover(target)
                 .with_context(|| format!("cannot recover target {name}"))?;
         }
-        Ok(())
+        recover_downloads(&downloads)
     })
     .await??;
-    let mut status = RuntimeStatus {
-        pid: std::process::id(),
-        version: VERSION.into(),
-        build_id: build_id().into(),
-        started_at: state::now()?,
-        updated_at: state::now()?,
-        ready: true,
-        ..Default::default()
-    };
+    status.ready = true;
+    status.updated_at = state::now()?;
     save_status(&directory, &status).await?;
     let (shutdown_sender, mut shutdown) = watch::channel(false);
     let signal_task = tokio::spawn(async move {
@@ -104,7 +125,7 @@ pub async fn run_with_logs(
         config: config.clone(),
         targets,
         directory: directory.clone(),
-        certificate_root: PathBuf::from(certkite_deploy::CERTIFICATE_ROOT),
+        certificate_root,
     };
     let mut failures = 0u32;
     let outcome = async {
@@ -181,6 +202,27 @@ pub async fn run_with_logs(
         }
     }
     outcome
+}
+
+fn recover_downloads(downloads: &Path) -> Result<()> {
+    if !downloads.try_exists()? {
+        return Ok(());
+    }
+    certkite_deploy::prepare_certificate_root(downloads)?;
+    for entry in fs::read_dir(downloads)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| certkite_protocol::valid_id(name, 64))
+        {
+            let directory = entry.path();
+            certkite_deploy::recover_file_target(&directory)
+                .with_context(|| format!("cannot recover download {}", directory.display()))?;
+        }
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() -> Result<()> {

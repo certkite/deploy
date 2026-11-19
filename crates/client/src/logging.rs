@@ -198,7 +198,7 @@ pub fn read(directory: &Path, lines: usize, level: Option<&str>) -> Result<Vec<L
         {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).context("cannot read client logs; try sudo"),
+            Err(error) => return Err(error).context("cannot read client logs"),
         };
         let metadata = file.metadata()?;
         ensure!(

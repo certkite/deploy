@@ -1,4 +1,5 @@
 """Exercise the hosted installer with signed local artifacts and no network."""
+import fcntl
 import hashlib
 import json
 import os
@@ -67,6 +68,26 @@ with tempfile.TemporaryDirectory(prefix="certkite-installer-") as temporary:
     assert installed.read_bytes() == artifact.read_bytes(), result
     assert not (root / "privileged-call").exists()
     before = installed.read_bytes()
+    lock = installed.parent / ".certkite-update.lock"
+    with lock.open("rb") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rejected = subprocess.run(["sh", installer], env=env, capture_output=True)
+        assert rejected.returncode != 0 and b"installation or update is active" in rejected.stderr
+        rejected = subprocess.run([installed, "update"], env=env, capture_output=True)
+        assert rejected.returncode != 0 and b"cannot acquire the CertKite installation lock" in rejected.stderr
+        assert installed.read_bytes() == before
+
+    newer = installed.with_name("newer")
+    newer.write_text("#!/bin/sh\nprintf 'certkite 999999.0.0\\n'\n")
+    newer.chmod(0o755)
+    newer.replace(installed)
+    rejected = subprocess.run(["sh", installer], env=env, capture_output=True)
+    assert rejected.returncode != 0 and b"refusing to downgrade" in rejected.stderr
+    assert run(installed, "--version").stdout == b"certkite 999999.0.0\n"
+    shutil.copyfile(artifact, installed)
+    run("sh", installer, env=env)
+    assert installed.read_bytes() == before
+
     envelope["manifest"] = raw + " "
     (root / "envelope").write_text(json.dumps(envelope))
     rejected = subprocess.run(["sh", installer], env=env, capture_output=True)
@@ -83,4 +104,4 @@ with tempfile.TemporaryDirectory(prefix="certkite-installer-") as temporary:
     rejected = subprocess.run(["sh", installer], env=env, capture_output=True)
     assert rejected.returncode != 0 and b"key is not configured" in rejected.stderr
     assert installed.read_bytes() == before
-print("Installer: signed user install, tampered manifest and artifact checks passed")
+print("Installer: signed installation, shared update lock, downgrade and tampering checks passed")

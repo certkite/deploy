@@ -1,4 +1,5 @@
-//! Signed, fixed-origin updates. Journal and all executable copies live on trusted local paths.
+//! Signed releases for user installations and existing system services.
+use crate::{config, state};
 use anyhow::{Context, Result, bail, ensure};
 use ed25519_dalek::{Signature, VerifyingKey};
 use fs2::FileExt;
@@ -6,7 +7,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -15,8 +16,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const STATE: &str = "/var/lib/certkite-client";
-const BINARY: &str = "/usr/local/bin/certkite";
+const STATE: &str = config::SYSTEM_STATE;
+const BINARY: &str = config::SYSTEM_BINARY;
 const SERVICE: &str = "certkite.service";
 const ORIGIN: &str = "https://certkite.com";
 const MAX_BINARY: u64 = 256 * 1024 * 1024;
@@ -61,7 +62,7 @@ pub struct UpdateJob {
 fn platform() -> Result<String> {
     ensure!(
         std::env::consts::OS == "linux",
-        "self-update requires Linux with systemd"
+        "self-update requires Linux"
     );
     let arch = match std::env::consts::ARCH {
         "x86_64" => "x86_64",
@@ -187,6 +188,71 @@ pub async fn check(to: Option<&str>) -> Result<UpdateCheck> {
     })
 }
 
+/// Verify and atomically replace the binary installed in the user's local bin directory.
+pub async fn install_user(to: Option<&str>) -> Result<UpdateCheck> {
+    platform()?;
+    let binary = config::user_binary()?;
+    let parent = binary.parent().context("missing user binary directory")?;
+    let uid = config::effective_uid();
+    for ancestor in parent.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .with_context(|| format!("inspect {}", ancestor.display()))?;
+        ensure!(
+            metadata.is_dir()
+                && (metadata.uid() == 0 || metadata.uid() == uid)
+                && (metadata.mode() & 0o022 == 0
+                    || (ancestor != parent && metadata.mode() & 0o1000 != 0)),
+            "untrusted installation directory: {}",
+            ancestor.display()
+        );
+    }
+    ensure!(
+        fs::metadata(parent)?.uid() == uid,
+        "user binary directory must belong to the running user"
+    );
+    let _lock = state::lock_file(&parent.join(".certkite-update.lock"), true)
+        .context("cannot acquire the CertKite installation lock")?;
+    // The procfs link identifies the executing inode even after an atomic replacement.
+    let running = fs::metadata("/proc/self/exe")?;
+    require_installed_binary(&binary, &running)?;
+    let update = check(to).await?;
+    if update.available {
+        let bytes = download(&update.manifest).await?;
+        let temporary = stage_bytes(&binary, &bytes, true)?;
+        validate_executable(&temporary, &update.manifest.version)?;
+        require_installed_binary(&binary, &running)?;
+        temporary.persist(&binary).map_err(|error| error.error)?;
+        sync_dir(parent)?;
+    }
+    Ok(update)
+}
+
+fn require_installed_binary(binary: &Path, running: &fs::Metadata) -> Result<()> {
+    let installed = fs::symlink_metadata(binary)?;
+    ensure!(
+        installed.is_file()
+            && installed.uid() == config::effective_uid()
+            && installed.mode() & 0o022 == 0,
+        "unsafe user binary ownership or permissions"
+    );
+    ensure!(
+        (installed.dev(), installed.ino()) == (running.dev(), running.ino()),
+        "run the currently installed executable at {} to update it",
+        binary.display()
+    );
+    Ok(())
+}
+
+async fn download(manifest: &Manifest) -> Result<Vec<u8>> {
+    let bytes = bounded_response(
+        client()?.get(&manifest.url).send().await?,
+        manifest.size as usize,
+    )
+    .await?;
+    verify_artifact(&bytes, manifest)?;
+    Ok(bytes)
+}
+
 #[cfg(unix)]
 fn trusted(path: &Path, directory: bool) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -281,7 +347,7 @@ fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
-fn atomic_bytes(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+fn stage_bytes(path: &Path, bytes: &[u8], executable: bool) -> Result<tempfile::TempPath> {
     let parent = path.parent().context("missing parent")?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
@@ -297,8 +363,15 @@ fn atomic_bytes(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
             }))?;
     }
     temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|e| e.error)?;
-    sync_dir(parent)
+    // Linux cannot execute a file while a writable descriptor to it is open.
+    Ok(temporary.into_temp_path())
+}
+
+fn atomic_bytes(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+    stage_bytes(path, bytes, executable)?
+        .persist(path)
+        .map_err(|error| error.error)?;
+    sync_dir(path.parent().context("missing parent")?)
 }
 fn save(job: &UpdateJob) -> Result<()> {
     atomic_bytes(&job.path, &serde_json::to_vec_pretty(job)?, false)
@@ -431,12 +504,7 @@ pub async fn launch(to: Option<&str>, config: &Path) -> Result<UpdateJob> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     }
-    let bytes = bounded_response(
-        client()?.get(&checked.manifest.url).send().await?,
-        checked.manifest.size as usize,
-    )
-    .await?;
-    verify_artifact(&bytes, &checked.manifest)?;
+    let bytes = download(&checked.manifest).await?;
     atomic_bytes(&dir.join("candidate"), &bytes, true)?;
     atomic_bytes(&dir.join("worker"), &fs::read(BINARY)?, true)?;
     let mut job = UpdateJob {
@@ -847,6 +915,27 @@ mod tests {
         assert!(verify_artifact(b"evil", &m).is_err());
         assert!(verify_artifact(b"\x7fELFmore", &m).is_err());
     }
+    #[test]
+    fn refuses_to_update_from_an_executable_that_has_been_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("certkite");
+        atomic_bytes(&binary, b"old", true).unwrap();
+        let running = File::open(&binary).unwrap();
+        require_installed_binary(&binary, &running.metadata().unwrap()).unwrap();
+        atomic_bytes(&binary, b"new", true).unwrap();
+        assert!(require_installed_binary(&binary, &running.metadata().unwrap()).is_err());
+        assert_eq!(fs::read(binary).unwrap(), b"new");
+    }
+
+    #[test]
+    fn staged_binary_can_be_executed_before_installing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("certkite");
+        let candidate = stage_bytes(&target, b"#!/bin/sh\nexit 0\n", true).unwrap();
+        assert!(Command::new(&candidate).status().unwrap().success());
+        assert!(!target.exists());
+    }
+
     #[test]
     fn atomic_replacement_and_mock_rollback() {
         use std::cell::RefCell;

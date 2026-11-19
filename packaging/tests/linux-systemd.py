@@ -1,4 +1,4 @@
-"""Run only on a disposable Linux VM: uses real systemd, Nginx and fixed paths."""
+"""Verify upgrade compatibility for an existing system service on a disposable Linux VM."""
 import hashlib
 import json
 import os
@@ -71,10 +71,32 @@ Path("/etc/nginx/conf.d/certkite-test.conf").write_text(
     "server { listen 8080; server_name integration.example; }\n"
 )
 run("systemctl", "reload", "nginx")
-run(BINARY, "service", "install")
-unit = run("systemctl", "cat", "certkite").stdout
-writable = next(line for line in unit.splitlines() if line.startswith("ReadWritePaths="))
-assert "/usr/local/bin" not in writable
+certificates = Path("/var/lib/certkite-certificates")
+certificates.mkdir(mode=0o711)
+unit = Path("/etc/systemd/system/certkite.service")
+assert not unit.exists()
+unit.write_text(f"""[Unit]
+Description=CertKite system service compatibility fixture
+
+[Service]
+Type=notify
+User=root
+Group=root
+ExecStart={BINARY} --config {config} __daemon
+Restart=on-failure
+StateDirectory=certkite-client
+StateDirectoryMode=0700
+RuntimeDirectory=certkite-client
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths={STATE} /run/certkite-client {certificates} /etc/nginx/conf.d
+""")
+run("systemctl", "daemon-reload")
+run("systemctl", "start", "certkite")
 pid = run("systemctl", "show", "certkite", "--property=MainPID", "--value").stdout.strip()
 probe = subprocess.run([
     "nsenter", "-t", pid, "-m", "--", "touch", "/usr/local/bin/certkite-write-probe"
@@ -126,4 +148,4 @@ with tempfile.TemporaryDirectory(prefix="certkite-systemd-", dir="/opt") as temp
         run("cc", f'-DVERSION="{version}"', f"-DFAIL_START={fail}", source, "-o", candidate)
         stage(worker, candidate, version, "0.1.0" if not fail else "0.1.1", not fail)
     run("systemctl", "stop", "certkite")
-print("Linux: generated sandbox, real notify startup, update and rollback passed")
+print("Linux: existing service sandbox, notify startup, update and rollback passed")

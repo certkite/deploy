@@ -454,6 +454,21 @@ pub fn recover(target: &TargetConfig) -> Result<()> {
     })()
     .context(Failure::RecoveryFailed)
 }
+/// Recover an existing download using its persisted access policy.
+pub fn recover_file_target(directory: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(directory)?;
+    let directory = directory.to_owned();
+    let target = match metadata.mode() & 0o777 {
+        0o700 => TargetConfig::Files { directory },
+        0o750 => TargetConfig::SharedFiles {
+            directory,
+            service_group: metadata.gid(),
+        },
+        _ => anyhow::bail!("invalid download directory permissions"),
+    };
+    recover(&target)
+}
+
 pub fn check(target: &TargetConfig) -> Result<()> {
     let _locks = locks(target)?;
     // Actually prove the runtime user can create and sync a private file.

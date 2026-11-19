@@ -27,7 +27,7 @@ pub struct Status {
 
 /// Read persisted status without creating identity or contacting the platform.
 pub fn status() -> Result<Status> {
-    let root = Path::new(config::STATE_DIR);
+    let root = config::state_directory()?;
     let id_path = root.join("identity.json");
     let client_id = if id_path.try_exists()? {
         Some(
@@ -87,10 +87,11 @@ pub async fn doctor(path: &Path) -> Result<DoctorReport> {
         "platform".into(),
         Check {
             ok: cfg!(target_os = "linux"),
-            message: "daemon and service management require Linux with systemd".into(),
+            message: "the CertKite daemon requires Linux".into(),
         },
     );
-    let targets = if cfg!(target_os = "linux") {
+    let system = config::is_system_installation();
+    let targets = if system {
         tokio::task::spawn_blocking(certkite_deploy::discover)
             .await
             .context("service discovery task failed")??
@@ -102,7 +103,12 @@ pub async fn doctor(path: &Path) -> Result<DoctorReport> {
             "discovery".into(),
             Check {
                 ok: true,
-                message: "no active Nginx or Caddy virtual hosts detected; certificates will be downloaded without deployment".into(),
+                message: if system {
+                    "no active Nginx or Caddy virtual hosts detected; certificates will be downloaded"
+                        .into()
+                } else {
+                    format!("certificate downloads: {}", config::user_certificate_root()?.display())
+                },
             },
         );
     }
